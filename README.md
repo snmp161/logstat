@@ -10,6 +10,7 @@ Implemented in Go as a static binary (`CGO_ENABLED=0`), configured through YAML.
 
 - [How it works](#how-it-works)
 - [Redis keys](#redis-keys)
+  - [Key expiry](#key-expiry)
 - [Configuration](#configuration)
 - [CLI](#cli)
 - [Building](#building)
@@ -43,6 +44,8 @@ The file offset is **deliberately not persisted** across restarts: the counter l
 | Internal counter | `logstat:counter:<host>:<action>` | integer | `INCRBY` / `SET 0` | always |
 | Monitoring value (heartbeat) | `logstat:heartbeat:<host>:<action>` | `server=<host> time=<iso8601> type=<action> lines=<N>` | `SET` | `heartbeat_key: true` |
 
+Both keys live for `redis.ttl` seconds, one day by default — see [Key expiry](#key-expiry).
+
 An example heartbeat value:
 
 ```
@@ -69,6 +72,19 @@ redis-cli --scan --pattern 'logstat:*_type=*' | xargs -r redis-cli del
 
 The integer counters `logstat:counter:<host>:<action>` are unchanged — the accumulated values survive the upgrade.
 
+### Key expiry
+
+`redis.ttl` (seconds, `86400` — one day — by default, `0` for no expiry) sets how long both keys live. The TTL is **sliding**: it is re-applied on every flush, including a flush that has nothing to write.
+
+That is deliberate, because `INCRBY` in Redis does not renew a TTL by itself: with a one-shot expiry the key of an actively used counter would die in the middle of a cycle and the count would silently restart from zero. So the TTL here does not measure how long a key exists, it measures **how long a key outlives the daemon**:
+
+- while the instance runs, the keys never expire — the TTL is renewed every `flush_interval` seconds;
+- once the instance is gone (host decommissioned, config removed, a word dropped from `actions`), its keys disappear on their own after `redis.ttl` instead of piling up in Redis as garbage.
+
+`redis.ttl` has to be **longer** than `flush_interval`, otherwise the keys can expire between two flushes; validation emits a warning if it is not.
+
+With `redis.ttl: 0` no expiry is set, and an expiry left over from an earlier configuration is removed: the daemon issues a one-off `PERSIST` at startup, so turning the option off is reversible without manual cleanup.
+
 ## Configuration
 
 The config path comes from `--config /etc/logstat/config.yaml` (short form `-c`). Defaults are built in: an absent field falls back to its default. An example carrying every field is [`packaging/default.yaml`](packaging/default.yaml).
@@ -92,6 +108,7 @@ redis:
   port: 6379
   db: 0
   password: ""
+  ttl: 86400
 
 logging:
   level: info
@@ -115,6 +132,7 @@ reset:
 | `redis.port` | int | `6379` | Redis port |
 | `redis.db` | int | `0` | Redis database number |
 | `redis.password` | string | `""` | `AUTH`, if `requirepass` is set |
+| `redis.ttl` | int (sec) | `86400` | key expiry, sliding; `0` for no expiry |
 | `logging.level` | string | `info` | `debug` / `info` / `warn` / `error` |
 | `logging.output` | string | `journald` | `journald` (stderr) or `file` |
 | `logging.file` | string | `""` | log file path when `output: file` (unique per config) |
@@ -134,7 +152,7 @@ Descriptors such as `@daily` and `@hourly` are accepted too. The six-field synta
 
 With `reset.enabled: false` the daemon only counts; the zeroing is done by something else (an external script or timer, or a manual `logstat clear`).
 
-**Validation at startup.** The config is parsed strictly: an unknown field is an error. The daemon checks that `actions` is not empty, that `flush_interval > 0`, that `lock_file` is set and its directory can be created, that `reset.schedule` is a valid 5-field cron expression, that `logging.level` and `logging.output` are from the allowed sets, and that with `output: file` the `logging.file` field is non-empty and the path writable. The values of `poll` and `heartbeat_key` must be booleans. A fatal config error exits with a non-zero code, which systemd shows in the unit status. Duplicates in `actions` and words that are a substring of another one produce a warning in the log but do not prevent the start.
+**Validation at startup.** The config is parsed strictly: an unknown field is an error. The daemon checks that `actions` is not empty, that `flush_interval > 0`, that `lock_file` is set and its directory can be created, that `reset.schedule` is a valid 5-field cron expression, that `logging.level` and `logging.output` are from the allowed sets, and that with `output: file` the `logging.file` field is non-empty and the path writable. The values of `poll` and `heartbeat_key` must be booleans and `redis.ttl` must not be negative. A fatal config error exits with a non-zero code, which systemd shows in the unit status. Duplicates in `actions` and words that are a substring of another one produce a warning in the log but do not prevent the start.
 
 ## CLI
 
@@ -277,7 +295,7 @@ make test     # go test -race ./...
 make cover    # plus a coverage profile and the resulting number
 ```
 
-No external services are needed: Redis is replaced by [miniredis](https://github.com/alicebob/miniredis) and log files are created in temporary directories. The suite covers matching (substring, case sensitivity, per-line counting, prefix overlaps), the config parser and validator, key and value formatting, assembling `lines=<N>` from the `INCRBY` reply, the `heartbeat_key: false` mode, computing the next firing time of cron schedules, tailing across both rotation schemes, starting with the log file absent, behaviour with Redis unavailable and catching up after recovery, resetting the counters (both directly and through the scheduler on an every-second schedule, without waiting for real cron), log level filtering and log file reopening, single-instance enforcement through `flock`, and a graceful shutdown on a real `SIGTERM` in a separate process.
+No external services are needed: Redis is replaced by [miniredis](https://github.com/alicebob/miniredis) and log files are created in temporary directories. The suite covers matching (substring, case sensitivity, per-line counting, prefix overlaps), the config parser and validator, key and value formatting, assembling `lines=<N>` from the `INCRBY` reply, the `heartbeat_key: false` mode, setting and renewing the TTL on both keys (including an abandoned key expiring and the expiry being cleared with `ttl: 0`), computing the next firing time of cron schedules, tailing across both rotation schemes, starting with the log file absent, behaviour with Redis unavailable and catching up after recovery, resetting the counters (both directly and through the scheduler on an every-second schedule, without waiting for real cron), log level filtering and log file reopening, single-instance enforcement through `flock`, and a graceful shutdown on a real `SIGTERM` in a separate process.
 
 ## License
 

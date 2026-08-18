@@ -174,6 +174,23 @@ func TestClear(t *testing.T) {
 		}
 	})
 
+	t.Run("applies the configured ttl", func(t *testing.T) {
+		dir := t.TempDir()
+		mr := miniredis.RunT(t)
+		// The config leaves redis.ttl at its default of one day.
+		cfgPath := writeConfig(t, dir, mr, "")
+		mustSet(t, mr, store.CounterKey(host, "get-number"), "42")
+
+		if got := run([]string{"clear", "-c", cfgPath, "--all"}); got != 0 {
+			t.Fatalf("exit code = %d, want 0", got)
+		}
+		for _, k := range []string{store.CounterKey(host, "get-number"), store.HeartbeatKey(host, "get-number")} {
+			if got := mr.TTL(k); got != 24*time.Hour {
+				t.Errorf("TTL of %s = %s, want 24h", k, got)
+			}
+		}
+	})
+
 	t.Run("without the heartbeat key", func(t *testing.T) {
 		dir := t.TempDir()
 		mr := miniredis.RunT(t)

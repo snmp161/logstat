@@ -84,6 +84,7 @@ type Store struct {
 	rdb       *redis.Client
 	host      string
 	heartbeat bool
+	ttl       time.Duration
 }
 
 // New connects (lazily, go-redis dials on first use) to the configured Redis.
@@ -97,12 +98,12 @@ func New(cfg config.Redis, host string, heartbeat bool) *Store {
 		DialTimeout:  5 * time.Second,
 		ReadTimeout:  3 * time.Second,
 		WriteTimeout: 3 * time.Second,
-	}), host, heartbeat)
+	}), host, heartbeat, cfg.TTLDuration())
 }
 
 // NewWithClient wraps an existing client. Used by tests against miniredis.
-func NewWithClient(rdb *redis.Client, host string, heartbeat bool) *Store {
-	return &Store{rdb: rdb, host: host, heartbeat: heartbeat}
+func NewWithClient(rdb *redis.Client, host string, heartbeat bool, ttl time.Duration) *Store {
+	return &Store{rdb: rdb, host: host, heartbeat: heartbeat, ttl: ttl}
 }
 
 // Host returns the host name embedded in the keys.
@@ -110,6 +111,17 @@ func (s *Store) Host() string { return s.host }
 
 // HeartbeatEnabled reports whether the monitoring value is maintained.
 func (s *Store) HeartbeatEnabled() bool { return s.heartbeat }
+
+// TTL returns the expiry applied to the keys, 0 meaning no expiry.
+func (s *Store) TTL() time.Duration { return s.ttl }
+
+// keys returns every key logstat maintains for action.
+func (s *Store) keys(action string) []string {
+	if !s.heartbeat {
+		return []string{CounterKey(s.host, action)}
+	}
+	return []string{CounterKey(s.host, action), HeartbeatKey(s.host, action)}
+}
 
 // Close releases the Redis connection pool.
 func (s *Store) Close() error { return s.rdb.Close() }
@@ -122,7 +134,7 @@ func (s *Store) Ping(ctx context.Context) error { return s.rdb.Ping(ctx).Err() }
 // fresh install is immediately readable by the monitoring side.
 func (s *Store) Init(ctx context.Context, actions []string, ts time.Time) error {
 	for _, a := range actions {
-		if err := s.rdb.SetNX(ctx, CounterKey(s.host, a), 0, 0).Err(); err != nil {
+		if err := s.rdb.SetNX(ctx, CounterKey(s.host, a), 0, s.ttl).Err(); err != nil {
 			return fmt.Errorf("init counter for %q: %w", a, err)
 		}
 		if !s.heartbeat {
@@ -132,20 +144,63 @@ func (s *Store) Init(ctx context.Context, actions []string, ts time.Time) error 
 		if err != nil {
 			return fmt.Errorf("init counter for %q: %w", a, err)
 		}
-		if err := s.rdb.SetNX(ctx, HeartbeatKey(s.host, a), FormatHeartbeat(s.host, ts, a, n), 0).Err(); err != nil {
+		if err := s.rdb.SetNX(ctx, HeartbeatKey(s.host, a), FormatHeartbeat(s.host, ts, a, n), s.ttl).Err(); err != nil {
 			return fmt.Errorf("init heartbeat for %q: %w", a, err)
 		}
 	}
 	return nil
 }
 
-// Incr adds delta to the integer counter and returns the new total.
+// Touch re-applies the configured expiry to every key of every action, so that
+// the keys of a live daemon never expire and the TTL only measures how long they
+// outlive it. With a TTL of 0 it removes an expiry left over from an earlier
+// configuration, which makes the option reversible without manual cleanup.
+func (s *Store) Touch(ctx context.Context, actions []string) error {
+	if len(actions) == 0 {
+		return nil
+	}
+	pipe := s.rdb.Pipeline()
+	for _, a := range actions {
+		for _, k := range s.keys(a) {
+			if s.ttl > 0 {
+				pipe.Expire(ctx, k, s.ttl)
+			} else {
+				pipe.Persist(ctx, k)
+			}
+		}
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("refresh ttl: %w", err)
+	}
+	return nil
+}
+
+// Incr adds delta to the integer counter and returns the new total. INCRBY
+// leaves the expiry of an existing key untouched, so the TTL is re-applied in
+// the same round trip.
 func (s *Store) Incr(ctx context.Context, action string, delta int64) (int64, error) {
-	n, err := s.rdb.IncrBy(ctx, CounterKey(s.host, action), delta).Result()
-	if err != nil {
+	key := CounterKey(s.host, action)
+	if s.ttl <= 0 {
+		n, err := s.rdb.IncrBy(ctx, key, delta).Result()
+		if err != nil {
+			return 0, fmt.Errorf("incrby %q: %w", action, err)
+		}
+		return n, nil
+	}
+
+	pipe := s.rdb.Pipeline()
+	incr := pipe.IncrBy(ctx, key, delta)
+	expire := pipe.Expire(ctx, key, s.ttl)
+	if _, err := pipe.Exec(ctx); err != nil {
 		return 0, fmt.Errorf("incrby %q: %w", action, err)
 	}
-	return n, nil
+	if err := incr.Err(); err != nil {
+		return 0, fmt.Errorf("incrby %q: %w", action, err)
+	}
+	if err := expire.Err(); err != nil {
+		return 0, fmt.Errorf("expire %q: %w", action, err)
+	}
+	return incr.Val(), nil
 }
 
 // SetHeartbeat writes the preformatted monitoring value for action. It is a
@@ -154,7 +209,7 @@ func (s *Store) SetHeartbeat(ctx context.Context, action string, lines int64, ts
 	if !s.heartbeat {
 		return nil
 	}
-	if err := s.rdb.Set(ctx, HeartbeatKey(s.host, action), FormatHeartbeat(s.host, ts, action, lines), 0).Err(); err != nil {
+	if err := s.rdb.Set(ctx, HeartbeatKey(s.host, action), FormatHeartbeat(s.host, ts, action, lines), s.ttl).Err(); err != nil {
 		return fmt.Errorf("set heartbeat %q: %w", action, err)
 	}
 	return nil
@@ -162,7 +217,7 @@ func (s *Store) SetHeartbeat(ctx context.Context, action string, lines int64, ts
 
 // Reset zeroes the counter of action and writes the matching lines=0 heartbeat.
 func (s *Store) Reset(ctx context.Context, action string, ts time.Time) error {
-	if err := s.rdb.Set(ctx, CounterKey(s.host, action), 0, 0).Err(); err != nil {
+	if err := s.rdb.Set(ctx, CounterKey(s.host, action), 0, s.ttl).Err(); err != nil {
 		return fmt.Errorf("reset counter %q: %w", action, err)
 	}
 	return s.SetHeartbeat(ctx, action, 0, ts)

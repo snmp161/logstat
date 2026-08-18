@@ -24,15 +24,20 @@ var ts = time.Date(2026, 8, 18, 15, 4, 5, 0, time.FixedZone("MSK", 3*3600))
 
 func newStore(t *testing.T) (*Store, *miniredis.Miniredis) {
 	t.Helper()
-	return newStoreWithHeartbeat(t, true)
+	return newTestStore(t, true, 0)
 }
 
 func newStoreWithHeartbeat(t *testing.T, heartbeat bool) (*Store, *miniredis.Miniredis) {
 	t.Helper()
+	return newTestStore(t, heartbeat, 0)
+}
+
+func newTestStore(t *testing.T, heartbeat bool, ttl time.Duration) (*Store, *miniredis.Miniredis) {
+	t.Helper()
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	return NewWithClient(rdb, host, heartbeat), mr
+	return NewWithClient(rdb, host, heartbeat, ttl), mr
 }
 
 func TestKeys(t *testing.T) {
@@ -291,7 +296,7 @@ func TestNewUsesConfiguredAddress(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	st := New(config.Redis{Host: h, Port: port, DB: 3}, host, true)
+	st := New(config.Redis{Host: h, Port: port, DB: 3, TTL: 3600}, host, true)
 	t.Cleanup(func() { _ = st.Close() })
 
 	ctx := context.Background()
@@ -384,4 +389,200 @@ func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+const day = 24 * time.Hour
+
+func TestTTLIsAppliedToEveryKey(t *testing.T) {
+	st, mr := newTestStore(t, true, day)
+	ctx := context.Background()
+
+	if st.TTL() != day {
+		t.Fatalf("TTL = %s, want %s", st.TTL(), day)
+	}
+
+	if err := st.Init(ctx, []string{"a"}, ts); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	for _, k := range []string{CounterKey(host, "a"), HeartbeatKey(host, "a")} {
+		if got := mr.TTL(k); got != day {
+			t.Errorf("TTL of %s after Init = %s, want %s", k, got, day)
+		}
+	}
+
+	// INCRBY does not renew an expiry by itself, so the store has to.
+	mr.FastForward(12 * time.Hour)
+	if _, err := st.Incr(ctx, "a", 1); err != nil {
+		t.Fatalf("Incr: %v", err)
+	}
+	if got := mr.TTL(CounterKey(host, "a")); got != day {
+		t.Errorf("TTL after Incr = %s, want it refreshed to %s", got, day)
+	}
+
+	if err := st.SetHeartbeat(ctx, "a", 1, ts); err != nil {
+		t.Fatalf("SetHeartbeat: %v", err)
+	}
+	if got := mr.TTL(HeartbeatKey(host, "a")); got != day {
+		t.Errorf("TTL after SetHeartbeat = %s, want %s", got, day)
+	}
+
+	if err := st.Reset(ctx, "a", ts); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	for _, k := range []string{CounterKey(host, "a"), HeartbeatKey(host, "a")} {
+		if got := mr.TTL(k); got != day {
+			t.Errorf("TTL of %s after Reset = %s, want %s", k, got, day)
+		}
+	}
+}
+
+func TestTouchRefreshesTTL(t *testing.T) {
+	st, mr := newTestStore(t, true, day)
+	ctx := context.Background()
+	actions := []string{"a", "b"}
+
+	if err := st.Init(ctx, actions, ts); err != nil {
+		t.Fatal(err)
+	}
+	mr.FastForward(20 * time.Hour)
+	for _, k := range []string{CounterKey(host, "a"), HeartbeatKey(host, "b")} {
+		if got := mr.TTL(k); got != 4*time.Hour {
+			t.Fatalf("TTL of %s = %s, want 4h before the refresh", k, got)
+		}
+	}
+
+	if err := st.Touch(ctx, actions); err != nil {
+		t.Fatalf("Touch: %v", err)
+	}
+	for _, a := range actions {
+		for _, k := range []string{CounterKey(host, a), HeartbeatKey(host, a)} {
+			if got := mr.TTL(k); got != day {
+				t.Errorf("TTL of %s after Touch = %s, want %s", k, got, day)
+			}
+		}
+	}
+}
+
+// The counter of an idle action would silently lose its total if nothing kept it
+// alive, so an expiry that is never refreshed is exactly what must not happen.
+func TestKeysExpireOnlyWithoutARefresh(t *testing.T) {
+	st, mr := newTestStore(t, true, day)
+	ctx := context.Background()
+
+	if err := st.Init(ctx, []string{"a"}, ts); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Incr(ctx, "a", 7); err != nil {
+		t.Fatal(err)
+	}
+
+	// Refreshed in time: the total is still there.
+	mr.FastForward(23 * time.Hour)
+	if err := st.Touch(ctx, []string{"a"}); err != nil {
+		t.Fatal(err)
+	}
+	mr.FastForward(23 * time.Hour)
+	if got, _ := mr.Get(CounterKey(host, "a")); got != "7" {
+		t.Fatalf("counter = %q, want 7: a refreshed key must not expire", got)
+	}
+
+	// Left alone past the TTL: gone, which is how a dead instance is cleaned up.
+	mr.FastForward(2 * time.Hour)
+	if mr.Exists(CounterKey(host, "a")) || mr.Exists(HeartbeatKey(host, "a")) {
+		t.Errorf("keys = %v, want them expired", mr.Keys())
+	}
+}
+
+func TestTTLZeroLeavesKeysForever(t *testing.T) {
+	st, mr := newTestStore(t, true, 0)
+	ctx := context.Background()
+
+	if err := st.Init(ctx, []string{"a"}, ts); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Incr(ctx, "a", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetHeartbeat(ctx, "a", 1, ts); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{CounterKey(host, "a"), HeartbeatKey(host, "a")} {
+		if got := mr.TTL(k); got != 0 {
+			t.Errorf("TTL of %s = %s, want no expiry", k, got)
+		}
+	}
+	mr.FastForward(365 * day)
+	if !mr.Exists(CounterKey(host, "a")) {
+		t.Error("a key without an expiry must survive")
+	}
+}
+
+// Turning the option off has to be reversible: Touch clears an expiry that an
+// earlier configuration left behind.
+func TestTouchWithTTLZeroPersistsExistingKeys(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	ctx := context.Background()
+
+	expiring := NewWithClient(rdb, host, true, day)
+	if err := expiring.Init(ctx, []string{"a"}, ts); err != nil {
+		t.Fatal(err)
+	}
+	if got := mr.TTL(CounterKey(host, "a")); got != day {
+		t.Fatalf("TTL = %s, want %s", got, day)
+	}
+
+	persisting := NewWithClient(rdb, host, true, 0)
+	if err := persisting.Touch(ctx, []string{"a"}); err != nil {
+		t.Fatalf("Touch: %v", err)
+	}
+	for _, k := range []string{CounterKey(host, "a"), HeartbeatKey(host, "a")} {
+		if got := mr.TTL(k); got != 0 {
+			t.Errorf("TTL of %s = %s, want it cleared", k, got)
+		}
+	}
+	mr.FastForward(2 * day)
+	if !mr.Exists(CounterKey(host, "a")) {
+		t.Error("the key must survive after the expiry was cleared")
+	}
+}
+
+func TestTouchSkipsTheHeartbeatWhenDisabled(t *testing.T) {
+	st, mr := newTestStore(t, false, day)
+	ctx := context.Background()
+
+	if err := mr.Set(HeartbeatKey(host, "a"), "stale"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Init(ctx, []string{"a"}, ts); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Touch(ctx, []string{"a"}); err != nil {
+		t.Fatalf("Touch: %v", err)
+	}
+	if got := mr.TTL(CounterKey(host, "a")); got != day {
+		t.Errorf("counter TTL = %s, want %s", got, day)
+	}
+	if got := mr.TTL(HeartbeatKey(host, "a")); got != 0 {
+		t.Errorf("a disabled heartbeat must not be touched, TTL = %s", got)
+	}
+}
+
+func TestTouchAndTTLErrorsWhenRedisIsDown(t *testing.T) {
+	st, mr := newTestStore(t, true, day)
+	ctx := context.Background()
+	mr.Close()
+
+	if err := st.Touch(ctx, []string{"a"}); err == nil {
+		t.Error("Touch must fail once Redis is gone")
+	} else if !IsUnavailable(err) {
+		t.Errorf("the error must count as unavailable: %v", err)
+	}
+	if _, err := st.Incr(ctx, "a", 1); err == nil {
+		t.Error("Incr must fail once Redis is gone")
+	}
+	if err := st.Touch(ctx, nil); err != nil {
+		t.Errorf("Touch with no actions must be a no-op, got %v", err)
+	}
 }

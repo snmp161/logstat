@@ -35,6 +35,9 @@ func TestDefaults(t *testing.T) {
 	if cfg.Redis.Host != "127.0.0.1" || cfg.Redis.Port != 6379 || cfg.Redis.DB != 0 || cfg.Redis.Password != "" {
 		t.Errorf("redis = %+v", cfg.Redis)
 	}
+	if cfg.Redis.TTL != 86400 || cfg.Redis.TTLDuration() != 24*time.Hour {
+		t.Errorf("redis.ttl = %d (%s), want 86400 (24h)", cfg.Redis.TTL, cfg.Redis.TTLDuration())
+	}
 	if cfg.Redis.Addr() != "127.0.0.1:6379" {
 		t.Errorf("redis addr = %q", cfg.Redis.Addr())
 	}
@@ -63,6 +66,9 @@ func TestPartialConfigKeepsDefaults(t *testing.T) {
 	if !cfg.HeartbeatKey {
 		t.Fatalf("heartbeat_key default lost: %+v", cfg)
 	}
+	if cfg.Redis.TTL != 86400 {
+		t.Fatalf("redis.ttl default lost: %+v", cfg)
+	}
 }
 
 func TestParseFull(t *testing.T) {
@@ -80,6 +86,7 @@ redis:
   port: 6380
   db: 3
   password: secret
+  ttl: 3600
 logging:
   level: debug
   output: file
@@ -100,6 +107,9 @@ reset:
 	}
 	if cfg.Redis.Addr() != "10.0.0.5:6380" || cfg.Redis.DB != 3 || cfg.Redis.Password != "secret" {
 		t.Errorf("redis = %+v", cfg.Redis)
+	}
+	if cfg.Redis.TTLDuration() != time.Hour {
+		t.Errorf("redis.ttl = %s, want 1h", cfg.Redis.TTLDuration())
 	}
 	if cfg.Logging.Level != "debug" || cfg.Logging.Output != OutputFile {
 		t.Errorf("logging = %+v", cfg.Logging)
@@ -146,6 +156,7 @@ func TestValidateFatal(t *testing.T) {
 		{"empty redis host", func(c *Config) { c.Redis.Host = "" }, "redis.host"},
 		{"bad redis port", func(c *Config) { c.Redis.Port = 0 }, "redis.port"},
 		{"bad redis db", func(c *Config) { c.Redis.DB = -1 }, "redis.db"},
+		{"negative redis ttl", func(c *Config) { c.Redis.TTL = -1 }, "redis.ttl"},
 		{"bad level", func(c *Config) { c.Logging.Level = "trace" }, "logging.level"},
 		{"bad output", func(c *Config) { c.Logging.Output = "syslog" }, "logging.output"},
 		{"file output without file", func(c *Config) { c.Logging.Output = OutputFile }, "logging.file"},
@@ -165,6 +176,36 @@ func TestValidateFatal(t *testing.T) {
 				t.Fatalf("error = %v, want it to mention %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// A TTL at or below the flush interval lets the keys die between two flushes,
+// which silently resets the totals of a running daemon.
+func TestValidateWarnsOnTTLShorterThanFlushInterval(t *testing.T) {
+	cfg := Default()
+	cfg.FlushInterval = 10
+
+	for _, ttl := range []int{1, 10} {
+		cfg.Redis.TTL = ttl
+		warnings, err := cfg.Validate()
+		if err != nil {
+			t.Fatalf("ttl=%d must be a warning, not an error: %v", ttl, err)
+		}
+		if len(warnings) != 1 || !strings.Contains(warnings[0], "redis.ttl") {
+			t.Fatalf("ttl=%d warnings = %v", ttl, warnings)
+		}
+	}
+
+	// Comfortably longer, and "no expiry", are both silent.
+	for _, ttl := range []int{11, 86400, 0} {
+		cfg.Redis.TTL = ttl
+		warnings, err := cfg.Validate()
+		if err != nil {
+			t.Fatalf("ttl=%d: %v", ttl, err)
+		}
+		if len(warnings) != 0 {
+			t.Fatalf("ttl=%d warnings = %v, want none", ttl, warnings)
+		}
 	}
 }
 

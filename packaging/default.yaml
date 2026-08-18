@@ -43,6 +43,11 @@ redis:
   port: 6379
   db: 0
   password: ""           # for requirepass; empty means no AUTH
+  # Expiry of the keys logstat writes, in seconds (86400 = one day, 0 = never).
+  # It is refreshed on every flush, so it measures how long the keys outlive this
+  # instance: they survive as long as the daemon runs and disappear once it is
+  # gone for good. Must be longer than flush_interval.
+  ttl: 86400
 
 # The daemon's own log.
 logging:

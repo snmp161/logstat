@@ -119,6 +119,12 @@ release:
     The integer counters `logstat:counter:<host>:<action>` are never rewritten by
     an upgrade: whatever was accumulated keeps counting from its current value.
 
+    **Coming from v0.2.0 or earlier?** Since v0.3.0 the keys carry an expiry:
+    `redis.ttl` defaults to `86400` (one day). It is refreshed on every flush, so
+    the keys of a running instance never expire — they only disappear about a day
+    after the instance stops reporting. Set `redis.ttl: 0` under `redis:` to keep
+    the previous behaviour of keys that live forever.
+
     **Coming from v0.1.0?** The preformatted monitoring value was renamed in
     v0.2.0 from `logstat:<host>_type=<action>` to
     `logstat:heartbeat:<host>:<action>`, and it can now be switched off entirely

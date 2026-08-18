@@ -64,6 +64,7 @@ func newHarnessAt(t *testing.T, mr *miniredis.Miniredis, tweak func(*config.Conf
 	cfg.FlushInterval = 1
 	cfg.LogPath = filepath.Join(t.TempDir(), "app.log")
 	cfg.Reset.Enabled = false
+	cfg.Redis.TTL = 0
 	if tweak != nil {
 		tweak(&cfg)
 	}
@@ -85,7 +86,7 @@ func newHarnessAt(t *testing.T, mr *miniredis.Miniredis, tweak func(*config.Conf
 	t.Cleanup(func() { _ = rdb.Close() })
 
 	return &harness{
-		d:   New(&cfg, lg.Logger, store.NewWithClient(rdb, testHost, cfg.HeartbeatKey), opts...),
+		d:   New(&cfg, lg.Logger, store.NewWithClient(rdb, testHost, cfg.HeartbeatKey, cfg.Redis.TTLDuration()), opts...),
 		mr:  mr,
 		log: buf,
 		cfg: &cfg,
@@ -274,6 +275,62 @@ func TestFlushKeepsBufferWhenRedisIsDown(t *testing.T) {
 	}
 	if !strings.Contains(h.log.String(), "redis is back") {
 		t.Errorf("the recovery must be logged: %q", h.log.String())
+	}
+}
+
+// Keys of a running daemon must never expire: the flush re-applies the TTL, and
+// it has to do so even when there was nothing to write, otherwise the counter of
+// a quiet action would silently lose its total.
+func TestFlushAppliesAndRefreshesTTL(t *testing.T) {
+	const ttl = time.Hour
+	h := newHarness(t, func(c *config.Config) { c.Redis.TTL = int(ttl.Seconds()) })
+	ctx := context.Background()
+
+	h.d.Counter().ProcessLine("get-number")
+	h.d.Flush(ctx)
+
+	counterKey := store.CounterKey(testHost, "get-number")
+	beatKey := store.HeartbeatKey(testHost, "get-number")
+	for _, k := range []string{counterKey, beatKey} {
+		if got := h.mr.TTL(k); got != ttl {
+			t.Fatalf("TTL of %s = %s, want %s", k, got, ttl)
+		}
+	}
+
+	// Two thirds of the way to the expiry, with no new lines at all.
+	h.mr.FastForward(40 * time.Minute)
+	if got := h.mr.TTL(counterKey); got != 20*time.Minute {
+		t.Fatalf("TTL = %s, want 20m before the idle flush", got)
+	}
+	h.d.Flush(ctx)
+	for _, k := range []string{counterKey, beatKey} {
+		if got := h.mr.TTL(k); got != ttl {
+			t.Errorf("TTL of %s after an idle flush = %s, want it refreshed to %s", k, got, ttl)
+		}
+	}
+
+	// The idle flush refreshed rather than counted.
+	if got, _ := h.mr.Get(counterKey); got != "1" {
+		t.Errorf("counter = %q, want 1", got)
+	}
+}
+
+// Switching the expiry off has to take effect on keys that already carry one.
+func TestFlushWithTTLZeroClearsAnExistingExpiry(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.Redis.TTL = 0 })
+	counterKey := store.CounterKey(testHost, "get-number")
+
+	mustSet(t, h.mr, counterKey, "5")
+	h.mr.SetTTL(counterKey, time.Hour)
+
+	h.d.Flush(context.Background())
+
+	if got := h.mr.TTL(counterKey); got != 0 {
+		t.Errorf("TTL = %s, want it cleared", got)
+	}
+	h.mr.FastForward(2 * time.Hour)
+	if got, _ := h.mr.Get(counterKey); got != "5" {
+		t.Errorf("counter = %q, want 5: the key must not expire any more", got)
 	}
 }
 
@@ -619,10 +676,11 @@ func TestPerLineLoggingOnlyAtDebug(t *testing.T) {
 	cfg := config.Default()
 	cfg.LogPath = filepath.Join(t.TempDir(), "app.log")
 	cfg.Reset.Enabled = false
+	cfg.Redis.TTL = 0
 
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	defer func() { _ = rdb.Close() }()
-	d := New(&cfg, lg.Logger, store.NewWithClient(rdb, testHost, cfg.HeartbeatKey))
+	d := New(&cfg, lg.Logger, store.NewWithClient(rdb, testHost, cfg.HeartbeatKey, cfg.Redis.TTLDuration()))
 
 	d.Counter().ProcessLine("get-number")
 	d.Flush(context.Background())

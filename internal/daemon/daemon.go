@@ -84,6 +84,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		"poll", d.cfg.Poll,
 		"redis", d.cfg.Redis.Addr(),
 		"redis_db", d.cfg.Redis.DB,
+		"redis_ttl", d.cfg.Redis.TTLDuration(),
 		"host", d.store.Host(),
 		"heartbeat_key", d.cfg.HeartbeatKey,
 		"reset_enabled", d.cfg.Reset.Enabled,
@@ -200,6 +201,9 @@ func (d *Daemon) Flush(ctx context.Context) {
 
 	deltas := d.cnt.Drain()
 	if len(deltas) == 0 && len(d.pendingHeartbeats) == 0 && len(d.pendingResets) == 0 {
+		// Nothing to write, but the keys of an idle action still must not expire
+		// while the daemon is running.
+		d.refreshTTL(ctx)
 		d.log.Debug("flush: nothing to do")
 		return
 	}
@@ -240,6 +244,9 @@ func (d *Daemon) Flush(ctx context.Context) {
 
 	if len(unwritten) > 0 {
 		d.cnt.Restore(unwritten)
+	}
+	if !unreachable {
+		d.refreshTTL(ctx)
 	}
 	if errs == 0 {
 		d.noteRedisOK()
@@ -336,8 +343,29 @@ func (d *Daemon) ensureInit(ctx context.Context) bool {
 	}
 	d.initialized = true
 	d.noteRedisOK()
-	d.log.Info("redis keys initialised", "actions", len(d.cfg.Actions))
+	d.log.Info("redis keys initialised", "actions", len(d.cfg.Actions),
+		"ttl", d.cfg.Redis.TTLDuration())
+
+	// Once at startup, unconditionally: with a TTL of 0 this drops an expiry
+	// left over from a previous configuration, so the option is reversible.
+	if err := d.store.Touch(octx, d.cfg.Actions); err != nil {
+		d.noteRedisError("refresh ttl", err)
+	}
 	return true
+}
+
+// refreshTTL re-applies the key expiry. Keys of a live daemon must never expire,
+// so this runs on every flush; with expiry disabled there is nothing to refresh
+// (the one-off PERSIST already happened at startup).
+func (d *Daemon) refreshTTL(ctx context.Context) {
+	if d.store.TTL() <= 0 || !d.initialized {
+		return
+	}
+	octx, cancel := context.WithTimeout(context.WithoutCancel(ctx), opTimeout)
+	defer cancel()
+	if err := d.store.Touch(octx, d.cfg.Actions); err != nil {
+		d.noteRedisError("refresh ttl", err)
+	}
 }
 
 // noteRedisError logs the first error of an outage at warn level and keeps the

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/robfig/cron/v3"
 	"gopkg.in/yaml.v3"
@@ -24,17 +25,27 @@ const (
 // Levels accepted by logging.level, in increasing order of severity.
 var Levels = []string{"debug", "info", "warn", "error"}
 
-// Redis holds the connection parameters of a single (possibly remote) Redis instance.
+// Redis holds the connection parameters of a single (possibly remote) Redis
+// instance plus the expiry applied to the keys logstat writes.
 type Redis struct {
 	Host     string `yaml:"host"`
 	Port     int    `yaml:"port"`
 	DB       int    `yaml:"db"`
 	Password string `yaml:"password"`
+	// TTL is the key expiry in seconds, 0 meaning no expiry. It is refreshed on
+	// every flush, so it measures how long the keys outlive the daemon rather
+	// than how long they exist.
+	TTL int `yaml:"ttl"`
 }
 
 // Addr returns the host:port string accepted by go-redis.
 func (r Redis) Addr() string {
 	return fmt.Sprintf("%s:%d", r.Host, r.Port)
+}
+
+// TTLDuration returns the key expiry as a duration, 0 meaning no expiry.
+func (r Redis) TTLDuration() time.Duration {
+	return time.Duration(r.TTL) * time.Second
 }
 
 // Logging configures the daemon's own log (not the watched log file).
@@ -76,6 +87,7 @@ func Default() Config {
 			Host: "127.0.0.1",
 			Port: 6379,
 			DB:   0,
+			TTL:  86400, // one day
 		},
 		Logging: Logging{
 			Level:  "info",
@@ -167,6 +179,16 @@ func (c *Config) Validate() ([]string, error) {
 	}
 	if c.Redis.DB < 0 {
 		return warnings, fmt.Errorf("redis.db must be >= 0, got %d", c.Redis.DB)
+	}
+	if c.Redis.TTL < 0 {
+		return warnings, fmt.Errorf("redis.ttl must be >= 0 seconds, got %d", c.Redis.TTL)
+	}
+	// A TTL shorter than the flush interval would let the keys expire between two
+	// flushes even though the daemon is alive and counting.
+	if c.Redis.TTL > 0 && c.Redis.TTL <= c.FlushInterval {
+		warnings = append(warnings, fmt.Sprintf(
+			"redis.ttl (%ds) is not longer than flush_interval (%ds): keys may expire between two flushes and lose their total",
+			c.Redis.TTL, c.FlushInterval))
 	}
 
 	if !slices.Contains(Levels, c.Logging.Level) {
