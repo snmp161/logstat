@@ -1,0 +1,53 @@
+# logstat — example configuration for the instance "default".
+#
+# The template unit logstat@<name>.service reads /etc/logstat/<name>.yaml, so
+# this file belongs to `systemctl start logstat@default`. Copy it to
+# /etc/logstat/<name>.yaml for every additional instance and give each one its
+# own lock_file (and its own logging.file, if file logging is used).
+#
+# Every field below is optional: the built-in default is shown as the value.
+
+# Path to the watched log file. Any software writing line by line will do.
+log_path: /var/log/app.log
+
+# Code words to count. Matching is a case-sensitive substring search anywhere in
+# the line, counted once per line.
+# WARNING: avoid words that are a substring of another word in this list —
+# "getStatus" would also be counted inside "getStatusExtended". logstat logs a
+# warning at startup when it finds such a pair.
+actions:
+  - get-number
+  - get-sms
+  - getNumber
+  - getStatus
+
+# How often the in-memory buffer is flushed to Redis, in seconds.
+flush_interval: 10
+
+# Poll the file instead of using inotify. Needed on network file systems.
+poll: false
+
+# Lock file of this instance, protecting against a manual double start.
+# IMPORTANT: with several configs on one host every one of them needs its OWN
+# path. The template unit provides /run/logstat/<instance> via RuntimeDirectory,
+# which is the only writable location under ProtectSystem=strict.
+lock_file: /run/logstat/default/logstat.lock
+
+redis:
+  host: 127.0.0.1        # Redis may live on another machine
+  port: 6379
+  db: 0
+  password: ""           # for requirepass; empty means no AUTH
+
+# The daemon's own log.
+logging:
+  level: info            # debug | info | warn | error
+  output: journald       # journald (= stderr, collected by systemd) | file
+  file: ""               # only used with output: file; must be unique per config
+                         # and needs LogsDirectory=logstat in the unit, because
+                         # ProtectSystem=strict makes /var/log read-only
+
+# Self-reset of the counters on a cron schedule.
+reset:
+  enabled: true          # false: only count, something external does the zeroing
+  schedule: "0 0 * * *"  # standard 5-field cron; default is daily at midnight

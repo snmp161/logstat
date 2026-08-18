@@ -1,0 +1,123 @@
+# GoReleaser builds the release: static binaries, .deb/.rpm through its built-in
+# nfpm and the GitHub Release itself. `make package` uses nfpm.yaml directly for
+# local packaging — keep the two package layouts in sync.
+version: 2
+
+project_name: logstat
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: logstat
+    main: ./cmd/logstat
+    binary: logstat
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .FullCommit }}
+      - -X main.date={{ .Date }}
+
+archives:
+  - id: logstat
+    ids:
+      - logstat
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+      - NOTICE
+      - packaging/default.yaml
+      - packaging/logstat@.service
+
+nfpms:
+  - id: packages
+    ids:
+      - logstat
+    package_name: logstat
+    vendor: Sergey Ovchinnikov
+    homepage: https://github.com/snmp161/logstat
+    maintainer: Sergey Ovchinnikov <sovchinnikov@gmail.com>
+    license: Apache-2.0
+    description: |
+      Count code words in a log file and keep the counters in Redis.
+      logstat follows a line-oriented log file in the manner of "tail -F", counts
+      the configured code words per line and maintains incremental counters in
+      Redis, which are optionally zeroed on a cron schedule.
+    section: utils
+    priority: optional
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    release: "1"
+    contents:
+      - src: packaging/default.yaml
+        dst: /etc/logstat/default.yaml
+        type: config|noreplace
+        file_info:
+          mode: 0644
+      - src: packaging/logstat@.service
+        dst: /lib/systemd/system/logstat@.service
+        file_info:
+          mode: 0644
+    overrides:
+      rpm:
+        contents:
+          - src: packaging/default.yaml
+            dst: /etc/logstat/default.yaml
+            type: config|noreplace
+            file_info:
+              mode: 0644
+          # On rpm distributions /lib is a symlink to /usr/lib, so the unit goes
+          # to its real path.
+          - src: packaging/logstat@.service
+            dst: /usr/lib/systemd/system/logstat@.service
+            file_info:
+              mode: 0644
+    scripts:
+      postinstall: packaging/scripts/postinstall.sh
+      preremove: packaging/scripts/preremove.sh
+      postremove: packaging/scripts/postremove.sh
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  draft: false
+  prerelease: auto
+  footer: |
+    ## Install
+
+    ```sh
+    # Debian/Ubuntu
+    sudo dpkg -i logstat_{{ trimprefix .Tag "v" }}-1_amd64.deb
+    # RHEL/Alma/Rocky
+    sudo rpm -i logstat-{{ trimprefix .Tag "v" }}-1.x86_64.rpm
+    ```
+
+    Then edit `/etc/logstat/<instance>.yaml` and run
+    `systemctl enable --now logstat@<instance>`.

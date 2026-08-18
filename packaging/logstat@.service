@@ -1,0 +1,30 @@
+[Unit]
+Description=logstat (%i): count codewords in a log file -> Redis
+Documentation=https://github.com/snmp161/logstat
+# No After=/Wants= on redis or nginx on purpose:
+# Redis may live on another machine and the in-memory buffer survives its
+# unavailability; the log source is arbitrary software. The daemon starts
+# independently and copes with a missing Redis and a missing or rotated log file.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/logstat run --config /etc/logstat/%i.yaml
+# SIGHUP reopens the daemon's own log file (only relevant for logging.output: file).
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+User=logstat
+# Adjust to the owner/group of the log file being watched: adm fits nginx,
+# other software may need another group or none at all.
+SupplementaryGroups=adm
+# %i in RuntimeDirectory gives every config its own /run/logstat/<instance>.
+RuntimeDirectory=logstat/%i
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

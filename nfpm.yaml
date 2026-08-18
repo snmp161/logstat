@@ -1,0 +1,61 @@
+# nfpm configuration for `make package`: builds the .deb and the .rpm from an
+# already compiled binary. VERSION and ARCH come from the environment and the
+# binary is staged at dist/pkgroot/logstat, both done by the Makefile.
+# Releases are built by GoReleaser instead, which carries its own copy of this
+# layout in .goreleaser.yaml — keep the two in sync.
+name: logstat
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+release: "1"
+section: utils
+priority: optional
+maintainer: Sergey Ovchinnikov <sovchinnikov@gmail.com>
+vendor: Sergey Ovchinnikov
+homepage: https://github.com/snmp161/logstat
+license: Apache-2.0
+description: |
+  Count code words in a log file and keep the counters in Redis.
+  logstat follows a line-oriented log file in the manner of "tail -F", counts
+  the configured code words per line and maintains incremental counters in
+  Redis, which are optionally zeroed on a cron schedule.
+
+# The binary is static, so there is nothing to depend on.
+contents:
+  - src: ./dist/pkgroot/logstat
+    dst: /usr/bin/logstat
+    file_info:
+      mode: 0755
+  - src: ./packaging/default.yaml
+    dst: /etc/logstat/default.yaml
+    type: config|noreplace
+    file_info:
+      mode: 0644
+  - src: ./packaging/logstat@.service
+    dst: /lib/systemd/system/logstat@.service
+    file_info:
+      mode: 0644
+
+overrides:
+  rpm:
+    contents:
+      - src: ./dist/pkgroot/logstat
+        dst: /usr/bin/logstat
+        file_info:
+          mode: 0755
+      - src: ./packaging/default.yaml
+        dst: /etc/logstat/default.yaml
+        type: config|noreplace
+        file_info:
+          mode: 0644
+      # On rpm distributions /lib is a symlink to /usr/lib, so the unit is
+      # installed under its real path to avoid packaging into a symlinked dir.
+      - src: ./packaging/logstat@.service
+        dst: /usr/lib/systemd/system/logstat@.service
+        file_info:
+          mode: 0644
+
+scripts:
+  postinstall: ./packaging/scripts/postinstall.sh
+  preremove: ./packaging/scripts/preremove.sh
+  postremove: ./packaging/scripts/postremove.sh
