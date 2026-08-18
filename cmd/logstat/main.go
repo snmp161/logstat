@@ -98,7 +98,7 @@ func cmdRun(args []string) int {
 	}
 	defer func() { _ = lock.Release() }()
 
-	st := store.New(cfg.Redis, store.ShortHostname())
+	st := store.New(cfg.Redis, store.ShortHostname(), cfg.HeartbeatKey)
 	defer func() { _ = st.Close() }()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -157,7 +157,7 @@ func cmdClear(args []string) int {
 		actions = []string{*action}
 	}
 
-	st := store.New(cfg.Redis, store.ShortHostname())
+	st := store.New(cfg.Redis, store.ShortHostname(), cfg.HeartbeatKey)
 	defer func() { _ = st.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -171,7 +171,7 @@ func cmdClear(args []string) int {
 			failed++
 			continue
 		}
-		lg.Info("counter cleared", "action", a, "host", st.Host())
+		lg.Info("counter cleared", "action", a, "host", st.Host(), "heartbeat", st.HeartbeatEnabled())
 	}
 	if failed > 0 {
 		return 1

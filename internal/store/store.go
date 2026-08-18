@@ -1,5 +1,6 @@
 // Package store implements the Redis key schema of logstat: an integer counter
-// per action and a preformatted value for the external monitoring reader.
+// per action and an optional preformatted heartbeat value for the external
+// monitoring reader.
 package store
 
 import (
@@ -24,14 +25,15 @@ func CounterKey(host, action string) string {
 	return KeyPrefix + "counter:" + host + ":" + action
 }
 
-// ValueKey returns the key of the preformatted monitoring value for host/action.
-func ValueKey(host, action string) string {
-	return KeyPrefix + host + "_type=" + action
+// HeartbeatKey returns the key of the preformatted monitoring value for
+// host/action. It is only written when the heartbeat_key option is on.
+func HeartbeatKey(host, action string) string {
+	return KeyPrefix + "heartbeat:" + host + ":" + action
 }
 
-// FormatValue renders the monitoring value. The timestamp is ISO-8601 with a
+// FormatHeartbeat renders the monitoring value. The timestamp is ISO-8601 with a
 // timezone offset, i.e. the format produced by `date -Iseconds`.
-func FormatValue(host string, ts time.Time, action string, lines int64) string {
+func FormatHeartbeat(host string, ts time.Time, action string, lines int64) string {
 	return fmt.Sprintf("server=%s time=%s type=%s lines=%d",
 		host, ts.Format(time.RFC3339), action, lines)
 }
@@ -79,12 +81,15 @@ func IsUnavailable(err error) bool {
 
 // Store writes the counters of one host to one Redis instance.
 type Store struct {
-	rdb  *redis.Client
-	host string
+	rdb       *redis.Client
+	host      string
+	heartbeat bool
 }
 
 // New connects (lazily, go-redis dials on first use) to the configured Redis.
-func New(cfg config.Redis, host string) *Store {
+// heartbeat mirrors the heartbeat_key option: when false, only the integer
+// counters are maintained and the monitoring value is never written.
+func New(cfg config.Redis, host string, heartbeat bool) *Store {
 	return NewWithClient(redis.NewClient(&redis.Options{
 		Addr:         cfg.Addr(),
 		DB:           cfg.DB,
@@ -92,16 +97,19 @@ func New(cfg config.Redis, host string) *Store {
 		DialTimeout:  5 * time.Second,
 		ReadTimeout:  3 * time.Second,
 		WriteTimeout: 3 * time.Second,
-	}), host)
+	}), host, heartbeat)
 }
 
 // NewWithClient wraps an existing client. Used by tests against miniredis.
-func NewWithClient(rdb *redis.Client, host string) *Store {
-	return &Store{rdb: rdb, host: host}
+func NewWithClient(rdb *redis.Client, host string, heartbeat bool) *Store {
+	return &Store{rdb: rdb, host: host, heartbeat: heartbeat}
 }
 
 // Host returns the host name embedded in the keys.
 func (s *Store) Host() string { return s.host }
+
+// HeartbeatEnabled reports whether the monitoring value is maintained.
+func (s *Store) HeartbeatEnabled() bool { return s.heartbeat }
 
 // Close releases the Redis connection pool.
 func (s *Store) Close() error { return s.rdb.Close() }
@@ -117,12 +125,15 @@ func (s *Store) Init(ctx context.Context, actions []string, ts time.Time) error 
 		if err := s.rdb.SetNX(ctx, CounterKey(s.host, a), 0, 0).Err(); err != nil {
 			return fmt.Errorf("init counter for %q: %w", a, err)
 		}
+		if !s.heartbeat {
+			continue
+		}
 		n, err := s.rdb.Get(ctx, CounterKey(s.host, a)).Int64()
 		if err != nil {
 			return fmt.Errorf("init counter for %q: %w", a, err)
 		}
-		if err := s.rdb.SetNX(ctx, ValueKey(s.host, a), FormatValue(s.host, ts, a, n), 0).Err(); err != nil {
-			return fmt.Errorf("init value for %q: %w", a, err)
+		if err := s.rdb.SetNX(ctx, HeartbeatKey(s.host, a), FormatHeartbeat(s.host, ts, a, n), 0).Err(); err != nil {
+			return fmt.Errorf("init heartbeat for %q: %w", a, err)
 		}
 	}
 	return nil
@@ -137,20 +148,24 @@ func (s *Store) Incr(ctx context.Context, action string, delta int64) (int64, er
 	return n, nil
 }
 
-// SetValue writes the preformatted monitoring value for action.
-func (s *Store) SetValue(ctx context.Context, action string, lines int64, ts time.Time) error {
-	if err := s.rdb.Set(ctx, ValueKey(s.host, action), FormatValue(s.host, ts, action, lines), 0).Err(); err != nil {
-		return fmt.Errorf("set value %q: %w", action, err)
+// SetHeartbeat writes the preformatted monitoring value for action. It is a
+// no-op when the heartbeat key is disabled, so callers do not have to branch.
+func (s *Store) SetHeartbeat(ctx context.Context, action string, lines int64, ts time.Time) error {
+	if !s.heartbeat {
+		return nil
+	}
+	if err := s.rdb.Set(ctx, HeartbeatKey(s.host, action), FormatHeartbeat(s.host, ts, action, lines), 0).Err(); err != nil {
+		return fmt.Errorf("set heartbeat %q: %w", action, err)
 	}
 	return nil
 }
 
-// Reset zeroes the counter of action and writes the matching lines=0 value.
+// Reset zeroes the counter of action and writes the matching lines=0 heartbeat.
 func (s *Store) Reset(ctx context.Context, action string, ts time.Time) error {
 	if err := s.rdb.Set(ctx, CounterKey(s.host, action), 0, 0).Err(); err != nil {
 		return fmt.Errorf("reset counter %q: %w", action, err)
 	}
-	return s.SetValue(ctx, action, 0, ts)
+	return s.SetHeartbeat(ctx, action, 0, ts)
 }
 
 // Get returns the current value of the integer counter for action.

@@ -24,32 +24,37 @@ var ts = time.Date(2026, 8, 18, 15, 4, 5, 0, time.FixedZone("MSK", 3*3600))
 
 func newStore(t *testing.T) (*Store, *miniredis.Miniredis) {
 	t.Helper()
+	return newStoreWithHeartbeat(t, true)
+}
+
+func newStoreWithHeartbeat(t *testing.T, heartbeat bool) (*Store, *miniredis.Miniredis) {
+	t.Helper()
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	return NewWithClient(rdb, host), mr
+	return NewWithClient(rdb, host, heartbeat), mr
 }
 
 func TestKeys(t *testing.T) {
 	if got, want := CounterKey(host, "get-sms"), "logstat:counter:web01:get-sms"; got != want {
 		t.Errorf("CounterKey = %q, want %q", got, want)
 	}
-	if got, want := ValueKey(host, "get-sms"), "logstat:web01_type=get-sms"; got != want {
-		t.Errorf("ValueKey = %q, want %q", got, want)
+	if got, want := HeartbeatKey(host, "get-sms"), "logstat:heartbeat:web01:get-sms"; got != want {
+		t.Errorf("HeartbeatKey = %q, want %q", got, want)
 	}
-	if !strings.HasPrefix(CounterKey(host, "x"), KeyPrefix) || !strings.HasPrefix(ValueKey(host, "x"), KeyPrefix) {
+	if !strings.HasPrefix(CounterKey(host, "x"), KeyPrefix) || !strings.HasPrefix(HeartbeatKey(host, "x"), KeyPrefix) {
 		t.Error("every key must start with the logstat: prefix")
 	}
 }
 
-func TestFormatValue(t *testing.T) {
-	got := FormatValue(host, ts, "getStatus", 42)
+func TestFormatHeartbeat(t *testing.T) {
+	got := FormatHeartbeat(host, ts, "getStatus", 42)
 	want := "server=web01 time=2026-08-18T15:04:05+03:00 type=getStatus lines=42"
 	if got != want {
-		t.Fatalf("FormatValue =\n%q\nwant\n%q", got, want)
+		t.Fatalf("FormatHeartbeat =\n%q\nwant\n%q", got, want)
 	}
 	// The timestamp must be the same shape as `date -Iseconds`.
-	if got := FormatValue(host, ts.UTC(), "x", 0); !strings.Contains(got, "time=2026-08-18T12:04:05Z") {
+	if got := FormatHeartbeat(host, ts.UTC(), "x", 0); !strings.Contains(got, "time=2026-08-18T12:04:05Z") {
 		t.Fatalf("UTC timestamp: %q", got)
 	}
 }
@@ -84,10 +89,10 @@ func TestInitCreatesMissingKeysOnly(t *testing.T) {
 	if got, _ := mr.Get(CounterKey(host, "b")); got != "0" {
 		t.Errorf("new counter = %q, want 0", got)
 	}
-	if got, _ := mr.Get(ValueKey(host, "a")); !strings.HasSuffix(got, "lines=17") {
+	if got, _ := mr.Get(HeartbeatKey(host, "a")); !strings.HasSuffix(got, "lines=17") {
 		t.Errorf("value of a = %q, want it to report the existing total", got)
 	}
-	if got, _ := mr.Get(ValueKey(host, "b")); !strings.HasSuffix(got, "lines=0") {
+	if got, _ := mr.Get(HeartbeatKey(host, "b")); !strings.HasSuffix(got, "lines=0") {
 		t.Errorf("value of b = %q", got)
 	}
 
@@ -97,6 +102,78 @@ func TestInitCreatesMissingKeysOnly(t *testing.T) {
 	}
 	if got, _ := mr.Get(CounterKey(host, "a")); got != "17" {
 		t.Errorf("second Init changed the counter: %q", got)
+	}
+}
+
+// With heartbeat_key off only the integer counters exist: no monitoring value is
+// created at init, written on a flush or touched on a reset.
+func TestHeartbeatDisabled(t *testing.T) {
+	st, mr := newStoreWithHeartbeat(t, false)
+	ctx := context.Background()
+
+	if st.HeartbeatEnabled() {
+		t.Fatal("HeartbeatEnabled must be false")
+	}
+
+	if err := st.Init(ctx, []string{"a"}, ts); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if got, _ := mr.Get(CounterKey(host, "a")); got != "0" {
+		t.Errorf("counter = %q, want 0", got)
+	}
+	if mr.Exists(HeartbeatKey(host, "a")) {
+		t.Error("Init must not create the heartbeat key when it is disabled")
+	}
+
+	if _, err := st.Incr(ctx, "a", 4); err != nil {
+		t.Fatalf("Incr: %v", err)
+	}
+	if err := st.SetHeartbeat(ctx, "a", 4, ts); err != nil {
+		t.Fatalf("SetHeartbeat must be a silent no-op: %v", err)
+	}
+	if mr.Exists(HeartbeatKey(host, "a")) {
+		t.Error("SetHeartbeat must not write the key when it is disabled")
+	}
+
+	if err := st.Reset(ctx, "a", ts); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	if got, _ := mr.Get(CounterKey(host, "a")); got != "0" {
+		t.Errorf("counter after reset = %q, want 0", got)
+	}
+	if mr.Exists(HeartbeatKey(host, "a")) {
+		t.Error("Reset must not write the heartbeat key when it is disabled")
+	}
+
+	// Only the counter key exists, nothing else was created along the way.
+	if got := mr.Keys(); len(got) != 1 || got[0] != CounterKey(host, "a") {
+		t.Errorf("keys = %v, want only %q", got, CounterKey(host, "a"))
+	}
+}
+
+// A pre-existing heartbeat key is left alone rather than deleted: turning the
+// option off stops the updates, cleaning up is the operator's call.
+func TestHeartbeatDisabledLeavesAnExistingKeyUntouched(t *testing.T) {
+	st, mr := newStoreWithHeartbeat(t, false)
+	ctx := context.Background()
+
+	stale := FormatHeartbeat(host, ts, "a", 7)
+	if err := mr.Set(HeartbeatKey(host, "a"), stale); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.Init(ctx, []string{"a"}, ts); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if _, err := st.Incr(ctx, "a", 1); err != nil {
+		t.Fatalf("Incr: %v", err)
+	}
+	if err := st.Reset(ctx, "a", ts); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+
+	if got, _ := mr.Get(HeartbeatKey(host, "a")); got != stale {
+		t.Errorf("heartbeat = %q, want it untouched (%q)", got, stale)
 	}
 }
 
@@ -111,8 +188,8 @@ func TestIncrAndSetValue(t *testing.T) {
 	if n != 3 {
 		t.Fatalf("Incr returned %d, want 3", n)
 	}
-	if err := st.SetValue(ctx, "get-sms", n, ts); err != nil {
-		t.Fatalf("SetValue: %v", err)
+	if err := st.SetHeartbeat(ctx, "get-sms", n, ts); err != nil {
+		t.Fatalf("SetHeartbeat: %v", err)
 	}
 
 	// The next batch must build lines=<N> from the new INCRBY reply.
@@ -123,14 +200,14 @@ func TestIncrAndSetValue(t *testing.T) {
 	if n != 7 {
 		t.Fatalf("Incr returned %d, want 7", n)
 	}
-	if err := st.SetValue(ctx, "get-sms", n, ts); err != nil {
-		t.Fatalf("SetValue: %v", err)
+	if err := st.SetHeartbeat(ctx, "get-sms", n, ts); err != nil {
+		t.Fatalf("SetHeartbeat: %v", err)
 	}
 
 	if got, _ := mr.Get(CounterKey(host, "get-sms")); got != "7" {
 		t.Errorf("counter = %q, want 7", got)
 	}
-	got, _ := mr.Get(ValueKey(host, "get-sms"))
+	got, _ := mr.Get(HeartbeatKey(host, "get-sms"))
 	want := "server=web01 time=2026-08-18T15:04:05+03:00 type=get-sms lines=7"
 	if got != want {
 		t.Errorf("value = %q, want %q", got, want)
@@ -148,7 +225,7 @@ func TestReset(t *testing.T) {
 	if _, err := st.Incr(ctx, "getStatus", 99); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SetValue(ctx, "getStatus", 99, ts); err != nil {
+	if err := st.SetHeartbeat(ctx, "getStatus", 99, ts); err != nil {
 		t.Fatal(err)
 	}
 
@@ -158,7 +235,7 @@ func TestReset(t *testing.T) {
 	if got, _ := mr.Get(CounterKey(host, "getStatus")); got != "0" {
 		t.Errorf("counter after reset = %q, want 0", got)
 	}
-	got, _ := mr.Get(ValueKey(host, "getStatus"))
+	got, _ := mr.Get(HeartbeatKey(host, "getStatus"))
 	if !strings.HasSuffix(got, "lines=0") {
 		t.Errorf("value after reset = %q, want lines=0", got)
 	}
@@ -188,8 +265,8 @@ func TestPingAndErrorsWhenRedisIsDown(t *testing.T) {
 	if _, err := st.Incr(ctx, "a", 1); err == nil {
 		t.Error("Incr must fail once Redis is gone")
 	}
-	if err := st.SetValue(ctx, "a", 1, ts); err == nil {
-		t.Error("SetValue must fail once Redis is gone")
+	if err := st.SetHeartbeat(ctx, "a", 1, ts); err == nil {
+		t.Error("SetHeartbeat must fail once Redis is gone")
 	}
 	if err := st.Reset(ctx, "a", ts); err == nil {
 		t.Error("Reset must fail once Redis is gone")
@@ -214,7 +291,7 @@ func TestNewUsesConfiguredAddress(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	st := New(config.Redis{Host: h, Port: port, DB: 3}, host)
+	st := New(config.Redis{Host: h, Port: port, DB: 3}, host, true)
 	t.Cleanup(func() { _ = st.Close() })
 
 	ctx := context.Background()

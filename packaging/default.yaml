@@ -27,6 +27,11 @@ flush_interval: 10
 # Poll the file instead of using inotify. Needed on network file systems.
 poll: false
 
+# Maintain the preformatted heartbeat key for the monitoring reader
+# (logstat:heartbeat:<host>:<action>). Set to false to keep only the integer
+# counters logstat:counter:<host>:<action>.
+heartbeat_key: true
+
 # Lock file of this instance, protecting against a manual double start.
 # IMPORTANT: with several configs on one host every one of them needs its OWN
 # path. The template unit provides /run/logstat/<instance> via RuntimeDirectory,

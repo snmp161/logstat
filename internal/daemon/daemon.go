@@ -36,9 +36,9 @@ type Daemon struct {
 	// initialized tracks whether the SETNX bootstrap has succeeded; it is
 	// retried on every flush until Redis becomes reachable.
 	initialized bool
-	// pendingValues holds totals whose formatted value could not be written
+	// pendingHeartbeats holds totals whose heartbeat value could not be written
 	// after a successful INCRBY, keyed by action.
-	pendingValues map[string]int64
+	pendingHeartbeats map[string]int64
 	// pendingResets holds actions whose scheduled reset failed and must be
 	// retried on the next flush.
 	pendingResets map[string]bool
@@ -59,12 +59,12 @@ func WithCronOptions(opts ...cron.Option) Option {
 // so that tests can inject miniredis and a buffer.
 func New(cfg *config.Config, lg *slog.Logger, st *store.Store, opts ...Option) *Daemon {
 	d := &Daemon{
-		cfg:           cfg,
-		log:           lg,
-		store:         st,
-		cnt:           counter.New(cfg.Actions),
-		pendingValues: make(map[string]int64),
-		pendingResets: make(map[string]bool),
+		cfg:               cfg,
+		log:               lg,
+		store:             st,
+		cnt:               counter.New(cfg.Actions),
+		pendingHeartbeats: make(map[string]int64),
+		pendingResets:     make(map[string]bool),
 	}
 	for _, o := range opts {
 		o(d)
@@ -85,6 +85,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		"redis", d.cfg.Redis.Addr(),
 		"redis_db", d.cfg.Redis.DB,
 		"host", d.store.Host(),
+		"heartbeat_key", d.cfg.HeartbeatKey,
 		"reset_enabled", d.cfg.Reset.Enabled,
 		"reset_schedule", d.cfg.Reset.Schedule)
 
@@ -198,7 +199,7 @@ func (d *Daemon) Flush(ctx context.Context) {
 	}
 
 	deltas := d.cnt.Drain()
-	if len(deltas) == 0 && len(d.pendingValues) == 0 && len(d.pendingResets) == 0 {
+	if len(deltas) == 0 && len(d.pendingHeartbeats) == 0 && len(d.pendingResets) == 0 {
 		d.log.Debug("flush: nothing to do")
 		return
 	}
@@ -260,10 +261,10 @@ func (d *Daemon) flushAction(ctx context.Context, action string, delta int64, no
 			return false, true, err
 		}
 		delete(d.pendingResets, action)
-		delete(d.pendingValues, action)
+		delete(d.pendingHeartbeats, action)
 	}
 
-	total, hasPending := d.pendingValues[action]
+	total, hasPending := d.pendingHeartbeats[action]
 	if delta == 0 && !hasPending {
 		return false, false, nil
 	}
@@ -276,13 +277,13 @@ func (d *Daemon) flushAction(ctx context.Context, action string, delta int64, no
 		total = n
 	}
 
-	if err := d.store.SetValue(octx, action, total, now); err != nil {
+	if err := d.store.SetHeartbeat(octx, action, total, now); err != nil {
 		// The increment is already in Redis: remember the total and retry only
-		// the formatted value.
-		d.pendingValues[action] = total
+		// the heartbeat value.
+		d.pendingHeartbeats[action] = total
 		return false, false, err
 	}
-	delete(d.pendingValues, action)
+	delete(d.pendingHeartbeats, action)
 	return true, false, nil
 }
 
@@ -310,7 +311,7 @@ func (d *Daemon) Reset(ctx context.Context) {
 			unreachable = store.IsUnavailable(err)
 			continue
 		}
-		delete(d.pendingValues, action)
+		delete(d.pendingHeartbeats, action)
 		delete(d.pendingResets, action)
 	}
 	if errs == 0 {

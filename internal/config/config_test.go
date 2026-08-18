@@ -26,6 +26,9 @@ func TestDefaults(t *testing.T) {
 	if cfg.Poll {
 		t.Error("poll = true, want false")
 	}
+	if !cfg.HeartbeatKey {
+		t.Error("heartbeat_key = false, want true by default")
+	}
 	if cfg.LockFile != "/run/logstat/logstat.lock" {
 		t.Errorf("lock_file = %q", cfg.LockFile)
 	}
@@ -57,6 +60,9 @@ func TestPartialConfigKeepsDefaults(t *testing.T) {
 	if len(cfg.Actions) != 4 || cfg.Redis.Port != 6379 || cfg.Reset.Schedule != "0 0 * * *" {
 		t.Fatalf("defaults lost: %+v", cfg)
 	}
+	if !cfg.HeartbeatKey {
+		t.Fatalf("heartbeat_key default lost: %+v", cfg)
+	}
 }
 
 func TestParseFull(t *testing.T) {
@@ -67,6 +73,7 @@ actions:
   - beta
 flush_interval: 5
 poll: true
+heartbeat_key: false
 lock_file: /run/logstat/nginx/logstat.lock
 redis:
   host: 10.0.0.5
@@ -87,6 +94,9 @@ reset:
 	}
 	if cfg.LogPath != "/var/log/nginx/access.log" || !cfg.Poll || cfg.FlushInterval != 5 {
 		t.Errorf("cfg = %+v", cfg)
+	}
+	if cfg.HeartbeatKey {
+		t.Error("heartbeat_key = true, want the configured false")
 	}
 	if cfg.Redis.Addr() != "10.0.0.5:6380" || cfg.Redis.DB != 3 || cfg.Redis.Password != "secret" {
 		t.Errorf("redis = %+v", cfg.Redis)
@@ -109,6 +119,7 @@ func TestParseErrors(t *testing.T) {
 	}{
 		{"broken yaml", "actions: [unclosed\n"},
 		{"wrong type", "flush_interval: not-a-number\n"},
+		{"wrong bool", "heartbeat_key: yesplease\n"},
 		{"unknown field", "flush_intervals: 10\n"},
 	}
 	for _, tc := range tests {

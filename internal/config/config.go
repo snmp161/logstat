@@ -56,6 +56,7 @@ type Config struct {
 	Actions       []string `yaml:"actions"`
 	FlushInterval int      `yaml:"flush_interval"`
 	Poll          bool     `yaml:"poll"`
+	HeartbeatKey  bool     `yaml:"heartbeat_key"`
 	LockFile      string   `yaml:"lock_file"`
 	Redis         Redis    `yaml:"redis"`
 	Logging       Logging  `yaml:"logging"`
@@ -69,6 +70,7 @@ func Default() Config {
 		Actions:       []string{"get-number", "get-sms", "getNumber", "getStatus"},
 		FlushInterval: 10,
 		Poll:          false,
+		HeartbeatKey:  true,
 		LockFile:      "/run/logstat/logstat.lock",
 		Redis: Redis{
 			Host: "127.0.0.1",

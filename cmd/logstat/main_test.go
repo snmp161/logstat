@@ -150,7 +150,7 @@ func TestClear(t *testing.T) {
 			if v, _ := mr.Get(store.CounterKey(host, a)); v != "0" {
 				t.Errorf("%s counter = %q, want 0", a, v)
 			}
-			if v, _ := mr.Get(store.ValueKey(host, a)); !strings.HasSuffix(v, "lines=0") {
+			if v, _ := mr.Get(store.HeartbeatKey(host, a)); !strings.HasSuffix(v, "lines=0") {
 				t.Errorf("%s value = %q, want lines=0", a, v)
 			}
 		}
@@ -171,6 +171,23 @@ func TestClear(t *testing.T) {
 		}
 		if v, _ := mr.Get(store.CounterKey(host, "get-number")); v != "42" {
 			t.Errorf("get-number = %q, want it untouched", v)
+		}
+	})
+
+	t.Run("without the heartbeat key", func(t *testing.T) {
+		dir := t.TempDir()
+		mr := miniredis.RunT(t)
+		cfgPath := writeConfig(t, dir, mr, "heartbeat_key: false\n")
+		mustSet(t, mr, store.CounterKey(host, "get-number"), "42")
+
+		if got := run([]string{"clear", "-c", cfgPath, "--all"}); got != 0 {
+			t.Fatalf("exit code = %d, want 0", got)
+		}
+		if v, _ := mr.Get(store.CounterKey(host, "get-number")); v != "0" {
+			t.Errorf("counter = %q, want 0", v)
+		}
+		if mr.Exists(store.HeartbeatKey(host, "get-number")) {
+			t.Error("clear must not create the heartbeat key when it is disabled")
 		}
 	})
 
@@ -282,7 +299,7 @@ func TestDaemonGracefulShutdown(t *testing.T) {
 		if v, _ := mr.Get(store.CounterKey(host, a)); v != want {
 			t.Errorf("%s counter = %q, want %s (the final flush must persist the buffer)", a, v, want)
 		}
-		if v, _ := mr.Get(store.ValueKey(host, a)); !strings.HasSuffix(v, "lines="+want) {
+		if v, _ := mr.Get(store.HeartbeatKey(host, a)); !strings.HasSuffix(v, "lines="+want) {
 			t.Errorf("%s value = %q, want lines=%s", a, v, want)
 		}
 	}

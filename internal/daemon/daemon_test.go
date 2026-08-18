@@ -85,7 +85,7 @@ func newHarnessAt(t *testing.T, mr *miniredis.Miniredis, tweak func(*config.Conf
 	t.Cleanup(func() { _ = rdb.Close() })
 
 	return &harness{
-		d:   New(&cfg, lg.Logger, store.NewWithClient(rdb, testHost), opts...),
+		d:   New(&cfg, lg.Logger, store.NewWithClient(rdb, testHost, cfg.HeartbeatKey), opts...),
 		mr:  mr,
 		log: buf,
 		cfg: &cfg,
@@ -101,9 +101,9 @@ func (h *harness) counter(t *testing.T, action string) string {
 	return v
 }
 
-func (h *harness) value(t *testing.T, action string) string {
+func (h *harness) heartbeat(t *testing.T, action string) string {
 	t.Helper()
-	v, err := h.mr.Get(store.ValueKey(testHost, action))
+	v, err := h.mr.Get(store.HeartbeatKey(testHost, action))
 	if err != nil {
 		return "<missing>"
 	}
@@ -150,7 +150,7 @@ func appendLines(t *testing.T, path string, lines ...string) {
 
 // --- unit level: flush and reset ------------------------------------------
 
-func TestFlushWritesCounterAndValue(t *testing.T) {
+func TestFlushWritesCounterAndHeartbeat(t *testing.T) {
 	h := newHarness(t, nil)
 	ctx := context.Background()
 
@@ -164,10 +164,13 @@ func TestFlushWritesCounterAndValue(t *testing.T) {
 	if got := h.counter(t, "get-sms"); got != "1" {
 		t.Errorf("get-sms counter = %s, want 1", got)
 	}
-	if got := h.value(t, "get-number"); !strings.HasSuffix(got, "lines=2") ||
+	if got := h.heartbeat(t, "get-number"); !strings.HasSuffix(got, "lines=2") ||
 		!strings.HasPrefix(got, "server=testhost time=") ||
 		!strings.Contains(got, "type=get-number") {
-		t.Errorf("get-number value = %q", got)
+		t.Errorf("get-number heartbeat = %q", got)
+	}
+	if !h.mr.Exists("logstat:heartbeat:testhost:get-number") {
+		t.Errorf("heartbeat key has the wrong name, keys = %v", h.mr.Keys())
 	}
 	// Untouched actions are initialised to zero, not left missing.
 	if got := h.counter(t, "getStatus"); got != "0" {
@@ -179,6 +182,39 @@ func TestFlushWritesCounterAndValue(t *testing.T) {
 	h.d.Flush(ctx)
 	if got := h.counter(t, "get-number"); got != "3" {
 		t.Errorf("get-number counter = %s, want 3", got)
+	}
+}
+
+// With heartbeat_key off the daemon maintains the integer counters only.
+func TestFlushWithoutHeartbeatKey(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.HeartbeatKey = false })
+	ctx := context.Background()
+
+	h.d.Counter().ProcessLine("a get-number b")
+	h.d.Counter().ProcessLine("get-sms")
+	h.d.Flush(ctx)
+
+	if got := h.counter(t, "get-number"); got != "1" {
+		t.Errorf("get-number counter = %s, want 1", got)
+	}
+	if got := h.heartbeat(t, "get-number"); got != "<missing>" {
+		t.Errorf("heartbeat key = %q, want it absent", got)
+	}
+
+	// A reset keeps the counters at zero and still writes no heartbeat.
+	h.d.Reset(ctx)
+	if got := h.counter(t, "get-number"); got != "0" {
+		t.Errorf("get-number counter after reset = %s, want 0", got)
+	}
+	for _, a := range h.cfg.Actions {
+		if got := h.heartbeat(t, a); got != "<missing>" {
+			t.Errorf("%s heartbeat = %q, want it absent", a, got)
+		}
+	}
+
+	// Only the four counter keys exist.
+	if got := h.mr.Keys(); len(got) != len(h.cfg.Actions) {
+		t.Errorf("keys = %v, want only the %d counters", got, len(h.cfg.Actions))
 	}
 }
 
@@ -233,7 +269,7 @@ func TestFlushKeepsBufferWhenRedisIsDown(t *testing.T) {
 	if got, _ := revived.Get(store.CounterKey(testHost, "get-number")); got != "2" {
 		t.Errorf("get-number = %s, want 2", got)
 	}
-	if got, _ := revived.Get(store.ValueKey(testHost, "get-sms")); !strings.HasSuffix(got, "lines=1") {
+	if got, _ := revived.Get(store.HeartbeatKey(testHost, "get-sms")); !strings.HasSuffix(got, "lines=1") {
 		t.Errorf("get-sms value = %q, want lines=1", got)
 	}
 	if !strings.Contains(h.log.String(), "redis is back") {
@@ -257,8 +293,8 @@ func TestResetZeroesEveryCounter(t *testing.T) {
 		if got := h.counter(t, a); got != "0" {
 			t.Errorf("%s counter after reset = %s, want 0", a, got)
 		}
-		if got := h.value(t, a); !strings.HasSuffix(got, "lines=0") {
-			t.Errorf("%s value after reset = %q, want lines=0", a, got)
+		if got := h.heartbeat(t, a); !strings.HasSuffix(got, "lines=0") {
+			t.Errorf("%s heartbeat after reset = %q, want lines=0", a, got)
 		}
 	}
 }
@@ -498,7 +534,7 @@ func TestRunSchedulerFiresTheReset(t *testing.T) {
 
 	h.waitFor(t, "the scheduled reset", func() bool {
 		return h.counter(t, "get-number") == "0" &&
-			strings.HasSuffix(h.value(t, "get-number"), "lines=0")
+			strings.HasSuffix(h.heartbeat(t, "get-number"), "lines=0")
 	})
 	h.waitFor(t, "the reset to be logged", func() bool {
 		out := h.log.String()
@@ -586,7 +622,7 @@ func TestPerLineLoggingOnlyAtDebug(t *testing.T) {
 
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	defer func() { _ = rdb.Close() }()
-	d := New(&cfg, lg.Logger, store.NewWithClient(rdb, testHost))
+	d := New(&cfg, lg.Logger, store.NewWithClient(rdb, testHost, cfg.HeartbeatKey))
 
 	d.Counter().ProcessLine("get-number")
 	d.Flush(context.Background())
