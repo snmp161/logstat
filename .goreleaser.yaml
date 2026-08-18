@@ -109,6 +109,25 @@ changelog:
 release:
   draft: false
   prerelease: auto
+  # Shown above the generated changelog. Kept permanent and worded per source
+  # version, so that whichever release page someone lands on tells them what an
+  # upgrade does to their Redis keys.
+  header: |
+    ## Upgrading
+
+    The integer counters `logstat:counter:<host>:<action>` are never rewritten by
+    an upgrade: whatever was accumulated keeps counting from its current value.
+
+    **Coming from v0.1.0?** The preformatted monitoring value was renamed in
+    v0.2.0 from `logstat:<host>_type=<action>` to
+    `logstat:heartbeat:<host>:<action>`, and it can now be switched off entirely
+    with `heartbeat_key: false`. Update the key pattern in your monitoring reader
+    and drop the stale keys, which logstat leaves alone:
+
+    ```sh
+    redis-cli --scan --pattern 'logstat:*_type=*' | xargs -r redis-cli del
+    ```
+
   footer: |
     ## Install
 
