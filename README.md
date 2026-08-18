@@ -1,75 +1,77 @@
 # logstat
 
-Демон, который непрерывно читает пишущийся текстовый лог-файл, ищет в каждой строке заданные кодовые слова и ведёт в Redis инкрементные счётчики по каждому слову. Счётчик растёт со временем и по расписанию (по умолчанию раз в сутки в полночь) обнуляется — внешний считыватель снимает значение по этому циклу. Самосброс отключаем.
+**English** | [Русский](README.ru.md)
 
-Демон не привязан ни к nginx, ни к формату лога: он работает с сырыми строками и матчит подстроку. Один процесс = один лог-файл; несколько логов на хосте обслуживаются несколькими инстансами шаблонного systemd-юнита.
+A daemon that follows a growing text log file, looks for the configured code words in every line and maintains incremental per-word counters in Redis. Each counter grows over time and is zeroed on a schedule (daily at midnight by default) — an external reader samples the value once per cycle. The self-reset can be switched off.
 
-Реализация: Go, статический бинарник (`CGO_ENABLED=0`), конфигурация — YAML.
+The daemon is tied neither to nginx nor to any log format: it works on raw lines and matches substrings. One process = one log file; several logs on a host are served by several instances of a template systemd unit.
 
-- [Как это работает](#как-это-работает)
-- [Ключи в Redis](#ключи-в-redis)
-- [Конфигурация](#конфигурация)
+Implemented in Go as a static binary (`CGO_ENABLED=0`), configured through YAML.
+
+- [How it works](#how-it-works)
+- [Redis keys](#redis-keys)
+- [Configuration](#configuration)
 - [CLI](#cli)
-- [Сборка](#сборка)
-- [Установка пакета](#установка-пакета)
-- [Мультиконфиг и мультиинстанс](#мультиконфиг-и-мультиинстанс)
-- [Логирование самого демона](#логирование-самого-демона)
-- [Права на чтение лога](#права-на-чтение-лога)
-- [Предупреждения оператору](#предупреждения-оператору)
-- [Удаление пакета](#удаление-пакета)
-- [Тесты](#тесты)
-- [Лицензия](#лицензия)
+- [Building](#building)
+- [Installing the package](#installing-the-package)
+- [Multiple configs and instances](#multiple-configs-and-instances)
+- [The daemon's own log](#the-daemons-own-log)
+- [Read permissions on the log](#read-permissions-on-the-log)
+- [Operator warnings](#operator-warnings)
+- [Removing the package](#removing-the-package)
+- [Tests](#tests)
+- [License](#license)
 
-## Как это работает
+## How it works
 
-1. Демон открывает лог-файл в режиме «`tail -F`». Существующий файл открывается **в конце** (аналог `tail -n0`) — то, что записано до старта, не считается. Если файла ещё нет (ПО-источник может подняться позже), демон не падает, а ждёт его появления и читает **с начала** появившегося файла.
-2. Для каждой новой строки проверяется вхождение каждого кодового слова: **подстрока в любом месте строки, регистрозависимо**. Счёт **по строке, не по вхождению** — слово встретилось в строке дважды, счётчик +1. Два разных слова в одной строке — инкрементится каждое.
-3. Инкременты копятся в памяти и сбрасываются в Redis пачкой раз в `flush_interval` секунд, а не на каждую строку. При сбросе: `INCRBY` целочисленного счётчика, затем — если включён `heartbeat_key` — `SET` форматированного heartbeat-значения с новым итогом из ответа `INCRBY`.
-4. Ротация лога проходится прозрачно, поддержаны оба режима logrotate: `create` (rename + новый файл, смена inode) и `copytruncate` (усечение на месте). Строки не теряются и не пересчитываются дважды.
-5. По cron-расписанию `reset.schedule` счётчики обнуляются: сначала флашится остаток буфера (строки завершающегося интервала попадают в него), затем `SET counter 0` и запись heartbeat-значения `lines=0`.
-6. Redis может быть недоступен (в т.ч. удалённый) — буфер копится в памяти, демон не падает и не теряет счёт, при восстановлении досбрасывает. Об аварии сообщается в лог один раз (повторы — на уровне `debug`), о восстановлении — тоже. Убедившись, что соединения нет, флаш прекращает обход остальных слов, чтобы не ждать таймаут подключения на каждое: время флаша и остановки демона не растёт с числом слов. Внутренние сообщения `go-redis` тоже уходят в лог демона (уровень `debug`), а не в stderr.
-7. По `SIGTERM`/`SIGINT` остаток буфера флашится и процесс выходит с кодом 0.
+1. The daemon follows the log file the way `tail -F` does. An existing file is opened **at its end** (like `tail -n0`) — whatever was written before the start is not counted. If the file does not exist yet (the source software may come up later), the daemon does not fail: it waits for the file to appear and then reads it **from the beginning**.
+2. Every new line is checked against each code word: **substring anywhere in the line, case-sensitive**. Counting is **per line, not per occurrence** — a word occurring twice in one line still adds 1. Two different words in one line increment both.
+3. Increments accumulate in memory and are flushed to Redis in one batch every `flush_interval` seconds instead of on every line. A flush issues `INCRBY` on the integer counter and then — if `heartbeat_key` is on — `SET`s the formatted heartbeat value with the new total taken from the `INCRBY` reply.
+4. Log rotation is handled transparently in both logrotate modes: `create` (rename plus a new file, so the inode changes) and `copytruncate` (truncation in place). No line is lost and none is counted twice.
+5. On the `reset.schedule` cron schedule the counters are zeroed: the rest of the buffer is flushed first (so the lines of the finishing interval are accounted for in it), then `SET counter 0` plus a heartbeat value of `lines=0`.
+6. Redis may be unreachable, including a remote one — the buffer keeps growing in memory, the daemon neither dies nor loses counts, and it catches up once Redis is back. An outage is logged once (repetitions at `debug` level), and so is the recovery. Once the connection is known to be down, the flush stops walking the remaining words instead of waiting for a connection timeout on each: neither a flush nor a shutdown grows with the number of words. Internal `go-redis` messages also go into the daemon log (at `debug`) rather than to stderr.
+7. On `SIGTERM`/`SIGINT` the rest of the buffer is flushed and the process exits with code 0.
 
-Оффсет файла между рестартами **сознательно не персистится**: счётчик живёт в Redis, поэтому рестарт не теряет накопленное, но строки, записанные за время простоя демона, не досчитываются.
+The file offset is **deliberately not persisted** across restarts: the counter lives in Redis, so a restart does not lose what was accumulated, but lines written while the daemon was down are not counted retroactively.
 
-## Ключи в Redis
+## Redis keys
 
-`<host>` — короткое имя хоста (эквивалент `hostname -s`), `<action>` — кодовое слово.
+`<host>` is the short host name (the equivalent of `hostname -s`), `<action>` is a code word.
 
-| Назначение | Ключ | Значение | Операция | Условие |
+| Purpose | Key | Value | Operation | Condition |
 |---|---|---|---|---|
-| Служебный счётчик | `logstat:counter:<host>:<action>` | целое число | `INCRBY` / `SET 0` | всегда |
-| Значение для мониторинга (heartbeat) | `logstat:heartbeat:<host>:<action>` | `server=<host> time=<iso8601> type=<action> lines=<N>` | `SET` | `heartbeat_key: true` |
+| Internal counter | `logstat:counter:<host>:<action>` | integer | `INCRBY` / `SET 0` | always |
+| Monitoring value (heartbeat) | `logstat:heartbeat:<host>:<action>` | `server=<host> time=<iso8601> type=<action> lines=<N>` | `SET` | `heartbeat_key: true` |
 
-Пример heartbeat-значения:
+An example heartbeat value:
 
 ```
 server=web01 time=2026-08-19T15:04:05+03:00 type=get-sms lines=1274
 ```
 
-Время — ISO-8601 с таймзоной, совместимо с `date -Iseconds`.
+The timestamp is ISO-8601 with a timezone offset, the format produced by `date -Iseconds`.
 
-Ключей два потому, что атомарно инкрементить форматированную строку нельзя: счёт ведётся на целочисленном ключе, а `<N>` для heartbeat-значения берётся из ответа `INCRBY`.
+There are two keys because a formatted string cannot be incremented atomically: counting happens on the integer key, and the `<N>` of the heartbeat value comes from the `INCRBY` reply.
 
-При старте отсутствующие ключи создаются через `SET ... NX` (счётчик — нулём, heartbeat — с текущим итогом счётчика), существующие **не затираются**: рестарт демона не сбрасывает накопленное. Благодаря этому внешний считыватель видит ключи сразу после установки, ещё до первого совпадения.
+At startup missing keys are created with `SET ... NX` (the counter with zero, the heartbeat with the counter's current total) and existing ones are **left alone**: restarting the daemon does not reset what was accumulated. As a result the external reader sees the keys right after installation, before the first match.
 
-**Heartbeat-ключ можно отключить.** При `heartbeat_key: false` демон ведёт только целочисленные счётчики: heartbeat не создаётся при инициализации, не пишется при флаше и не трогается при сбросе, включая `logstat clear`. Уже существующий ключ при выключении параметра **не удаляется** — обновления просто прекращаются, подчистить его при необходимости надо самому:
+**The heartbeat key can be switched off.** With `heartbeat_key: false` the daemon maintains the integer counters only: the heartbeat is not created at initialisation, not written on a flush and not touched by a reset, `logstat clear` included. An already existing key is **not deleted** when the option is turned off — the updates simply stop, and cleaning it up is up to you:
 
 ```sh
 redis-cli --scan --pattern 'logstat:heartbeat:*' | xargs -r redis-cli del
 ```
 
-**Миграция с v0.1.0.** В v0.1.0 ключ мониторинга назывался `logstat:<host>_type=<action>`. Начиная с v0.2.0 это `logstat:heartbeat:<host>:<action>`: обновите шаблон в считывателе и удалите старые ключи, демон их не тронет.
+**Migrating from v0.1.0.** In v0.1.0 the monitoring key was named `logstat:<host>_type=<action>`. Since v0.2.0 it is `logstat:heartbeat:<host>:<action>`: update the pattern in your reader and drop the old keys, which the daemon will not touch.
 
 ```sh
 redis-cli --scan --pattern 'logstat:*_type=*' | xargs -r redis-cli del
 ```
 
-Целочисленные счётчики `logstat:counter:<host>:<action>` не изменились — накопленные значения при обновлении не теряются.
+The integer counters `logstat:counter:<host>:<action>` are unchanged — the accumulated values survive the upgrade.
 
-## Конфигурация
+## Configuration
 
-Путь к конфигу — флаг `--config /etc/logstat/config.yaml` (короткий `-c`). Значения по умолчанию встроены: при отсутствии поля берётся дефолт. Пример со всеми полями — [`packaging/default.yaml`](packaging/default.yaml).
+The config path comes from `--config /etc/logstat/config.yaml` (short form `-c`). Defaults are built in: an absent field falls back to its default. An example carrying every field is [`packaging/default.yaml`](packaging/default.yaml).
 
 ```yaml
 log_path: /var/log/app.log
@@ -101,74 +103,74 @@ reset:
   schedule: "0 0 * * *"
 ```
 
-| Параметр | Тип | Дефолт | Назначение |
+| Parameter | Type | Default | Purpose |
 |---|---|---|---|
-| `log_path` | string | `/var/log/app.log` | путь к лог-файлу |
-| `actions` | list\<string\> | `[get-number, get-sms, getNumber, getStatus]` | кодовые слова |
-| `flush_interval` | int (сек) | `10` | период сброса буфера в Redis |
-| `poll` | bool | `false` | поллинг вместо inotify (для сетевых ФС) |
-| `heartbeat_key` | bool | `true` | вести heartbeat-ключ `logstat:heartbeat:<host>:<action>` |
-| `lock_file` | string | `/run/logstat/logstat.lock` | lock-файл инстанса (уникальный на конфиг) |
-| `redis.host` | string | `127.0.0.1` | хост Redis (может быть удалённым) |
-| `redis.port` | int | `6379` | порт Redis |
-| `redis.db` | int | `0` | номер БД Redis |
-| `redis.password` | string | `""` | `AUTH`, если задан `requirepass` |
+| `log_path` | string | `/var/log/app.log` | path to the watched log file |
+| `actions` | list\<string\> | `[get-number, get-sms, getNumber, getStatus]` | code words |
+| `flush_interval` | int (sec) | `10` | how often the buffer is flushed to Redis |
+| `poll` | bool | `false` | poll instead of using inotify (for network file systems) |
+| `heartbeat_key` | bool | `true` | maintain the heartbeat key `logstat:heartbeat:<host>:<action>` |
+| `lock_file` | string | `/run/logstat/logstat.lock` | lock file of the instance (unique per config) |
+| `redis.host` | string | `127.0.0.1` | Redis host (may be remote) |
+| `redis.port` | int | `6379` | Redis port |
+| `redis.db` | int | `0` | Redis database number |
+| `redis.password` | string | `""` | `AUTH`, if `requirepass` is set |
 | `logging.level` | string | `info` | `debug` / `info` / `warn` / `error` |
-| `logging.output` | string | `journald` | `journald` (stderr) или `file` |
-| `logging.file` | string | `""` | путь лог-файла при `output: file` (уникальный на конфиг) |
-| `reset.enabled` | bool | `true` | включить самосброс |
-| `reset.schedule` | string | `"0 0 * * *"` | cron-расписание сброса (стандартный 5-польный) |
+| `logging.output` | string | `journald` | `journald` (stderr) or `file` |
+| `logging.file` | string | `""` | log file path when `output: file` (unique per config) |
+| `reset.enabled` | bool | `true` | enable the self-reset |
+| `reset.schedule` | string | `"0 0 * * *"` | cron schedule of the reset (standard 5-field) |
 
-**Расписание сброса.** `reset.schedule` — стандартный 5-польный cron (`минута час день месяц день_недели`), часовой пояс локальный для хоста, срабатывание всегда в `:00` секунд целевой минуты. Никакой самописной логики времени нет, поэтому гибкость получается бесплатно:
+**The reset schedule.** `reset.schedule` is a standard 5-field cron expression (`minute hour day-of-month month day-of-week`), interpreted in the host's local timezone, always firing at `:00` seconds of the target minute. There is no hand-written time logic, so the flexibility comes for free:
 
-| Выражение | Смысл |
+| Expression | Meaning |
 |---|---|
-| `0 0 * * *` | раз в сутки в полночь (дефолт) |
-| `1 * * * *` | 1-я минута каждого часа |
-| `*/30 * * * *` | каждые полчаса |
-| `0 */6 * * *` | каждые 6 часов |
+| `0 0 * * *` | daily at midnight (default) |
+| `1 * * * *` | the first minute of every hour |
+| `*/30 * * * *` | every half hour |
+| `0 */6 * * *` | every six hours |
 
-Также принимаются дескрипторы вида `@daily`, `@hourly`. Шестипольный синтаксис с секундами **не** принимается сознательно.
+Descriptors such as `@daily` and `@hourly` are accepted too. The six-field syntax with seconds is deliberately **not** accepted.
 
-При `reset.enabled: false` демон только считает; обнуление выполняет кто-то снаружи (внешний скрипт/таймер или ручной `logstat clear`).
+With `reset.enabled: false` the daemon only counts; the zeroing is done by something else (an external script or timer, or a manual `logstat clear`).
 
-**Валидация при старте.** Конфиг парсится строго: неизвестные поля — ошибка. Проверяется, что `actions` непустой, `flush_interval > 0`, `lock_file` задан и его каталог создаваем, `reset.schedule` — валидное 5-польное cron-выражение, `logging.level` и `logging.output` из допустимого набора, при `output: file` поле `logging.file` непустое и путь записываем. Значения `poll` и `heartbeat_key` должны быть булевыми. Фатальная ошибка конфига — выход с ненулевым кодом (systemd покажет в статусе). Дубликаты в `actions` и слова, являющиеся подстрокой другого, дают предупреждение в лог, но не мешают старту.
+**Validation at startup.** The config is parsed strictly: an unknown field is an error. The daemon checks that `actions` is not empty, that `flush_interval > 0`, that `lock_file` is set and its directory can be created, that `reset.schedule` is a valid 5-field cron expression, that `logging.level` and `logging.output` are from the allowed sets, and that with `output: file` the `logging.file` field is non-empty and the path writable. The values of `poll` and `heartbeat_key` must be booleans. A fatal config error exits with a non-zero code, which systemd shows in the unit status. Duplicates in `actions` and words that are a substring of another one produce a warning in the log but do not prevent the start.
 
 ## CLI
 
 ```
-logstat run   --config <path>                 демон (основной режим)
-logstat clear --config <path> --all           обнулить все счётчики конфига
-logstat clear --config <path> --action <word> обнулить один счётчик
-logstat version                               версия, commit, дата сборки
-logstat --help                                справка
+logstat run   --config <path>                 run the daemon (main mode)
+logstat clear --config <path> --all           zero every counter of the config
+logstat clear --config <path> --action <word> zero a single counter
+logstat version                               version, commit, build date
+logstat --help                                help
 ```
 
-`clear` работает всегда, независимо от `reset.enabled`, и обнуляет и целочисленный счётчик, и heartbeat-значение (`lines=0`; при `heartbeat_key: false` heartbeat не трогается). `--action` принимает только слово, перечисленное в `actions` этого конфига — так опечатка не создаст мусорный ключ.
+`clear` works at any time, regardless of `reset.enabled`, and zeroes both the integer counter and the heartbeat value (`lines=0`; with `heartbeat_key: false` the heartbeat is left alone). `--action` only accepts a word listed in the `actions` of that config, so a typo cannot create a stray key.
 
-Коды возврата: `0` — успех, `1` — ошибка выполнения (конфиг, lock, Redis), `2` — ошибка использования.
+Exit codes: `0` success, `1` runtime failure (config, lock, Redis), `2` usage error.
 
-## Сборка
+## Building
 
-Нужен Go (версия зафиксирована в `go.mod`). `CGO_ENABLED=0` выставляется автоматически.
+Go is required; the version is pinned in `go.mod`. `CGO_ENABLED=0` is set automatically.
 
 ```sh
-make build          # статический бинарник для текущей архитектуры → dist/logstat
+make build          # static binary for the host architecture → dist/logstat
 make build-all      # linux/amd64 + linux/arm64 → dist/logstat_linux_<arch>/logstat
 make test           # go test -race ./...
-make cover          # тесты с профилем покрытия
+make cover          # tests with a coverage profile
 make lint           # gofmt + go vet + golangci-lint
-make package        # .deb и .rpm для обеих архитектур (нужен nfpm)
-make tools          # поставить nfpm и golangci-lint в GOPATH/bin
+make package        # .deb and .rpm for both architectures (needs nfpm)
+make tools          # install nfpm and golangci-lint into GOPATH/bin
 make clean
 make help
 ```
 
-Версия, commit и дата сборки вшиваются через `-ldflags` и видны в `logstat version`. По умолчанию версия берётся из `git describe`; можно задать явно: `make build VERSION=v1.2.3`.
+The version, commit and build date are baked in through `-ldflags` and shown by `logstat version`. By default the version comes from `git describe`; it can be set explicitly: `make build VERSION=v1.2.3`.
 
-Пакеты собираются через [nfpm](https://github.com/goreleaser/nfpm) из готового бинарника — один [`nfpm.yaml`](nfpm.yaml) на оба формата. Релизы собирает GoReleaser по [`.goreleaser.yaml`](.goreleaser.yaml): при пуше тега `v*` workflow [`release.yml`](.github/workflows/release.yml) публикует GitHub Release с бинарниками, `.deb`, `.rpm` и checksums. На каждый push и PR workflow [`ci.yml`](.github/workflows/ci.yml) прогоняет lint, `go test -race` с покрытием, кросс-сборку и сборку пакетов.
+Packages are built with [nfpm](https://github.com/goreleaser/nfpm) from the compiled binary — a single [`nfpm.yaml`](nfpm.yaml) covers both formats. Releases are built by GoReleaser from [`.goreleaser.yaml`](.goreleaser.yaml): on a `v*` tag push the [`release.yml`](.github/workflows/release.yml) workflow publishes a GitHub Release with the binaries, the `.deb`, the `.rpm` and checksums. On every push and pull request the [`ci.yml`](.github/workflows/ci.yml) workflow runs lint, `go test -race` with coverage, the cross build and the package build.
 
-## Установка пакета
+## Installing the package
 
 ```sh
 # Debian / Ubuntu
@@ -178,14 +180,14 @@ sudo dpkg -i logstat_<version>-1_amd64.deb
 sudo rpm -i logstat-<version>-1.x86_64.rpm
 ```
 
-Пакет ставит:
+The package installs:
 
-- `/usr/bin/logstat` — статический бинарник;
-- `/etc/logstat/default.yaml` — пример конфига как conffile / `%config(noreplace)`, при обновлении правки не затираются;
-- `/lib/systemd/system/logstat@.service` (на rpm-дистрибутивах — `/usr/lib/systemd/system/logstat@.service`) — шаблонный юнит;
-- postinstall создаёт системного пользователя `logstat`, делает `systemctl daemon-reload` и `try-restart 'logstat@*.service'`, чтобы после обновления работавшие инстансы поднялись на новом бинарнике.
+- `/usr/bin/logstat` — the static binary;
+- `/etc/logstat/default.yaml` — the example config as a conffile / `%config(noreplace)`, so an upgrade does not overwrite local edits;
+- `/lib/systemd/system/logstat@.service` (on rpm distributions `/usr/lib/systemd/system/logstat@.service`) — the template unit;
+- postinstall creates the system user `logstat`, runs `systemctl daemon-reload` and `try-restart 'logstat@*.service'` so that instances which were running before an upgrade come back on the new binary.
 
-Дальше — свой конфиг на каждый лог и запуск инстанса:
+Next comes a config per log file and starting the instance:
 
 ```sh
 sudoedit /etc/logstat/app1.yaml
@@ -194,35 +196,35 @@ systemctl status 'logstat@*'
 journalctl -u logstat@app1 -f
 ```
 
-Юнит намеренно **не** зависит ни от Redis, ни от nginx (только `network-online.target`): Redis может быть на другой машине, буфер в памяти переживает его недоступность, а источник лога произволен. При `reset.enabled: true` никакие таймеры и clear-сервисы не нужны.
+The unit deliberately depends on neither Redis nor nginx (only on `network-online.target`): Redis may live on another machine, the in-memory buffer survives its unavailability, and the log source is arbitrary. With `reset.enabled: true` no timers or clear services are needed.
 
-## Мультиконфиг и мультиинстанс
+## Multiple configs and instances
 
-Юнит шаблонный: экземпляр `logstat@<имя>` читает `/etc/logstat/<имя>.yaml`. Так `logstat@app1` парсит `/etc/logstat/app1.yaml`, `logstat@nginx` — `/etc/logstat/nginx.yaml`. Одиночный кейс — просто один инстанс, например `logstat@default` с `/etc/logstat/default.yaml`.
+The unit is a template: the instance `logstat@<name>` reads `/etc/logstat/<name>.yaml`. So `logstat@app1` parses `/etc/logstat/app1.yaml` and `logstat@nginx` parses `/etc/logstat/nginx.yaml`. The single-log case is just one instance, for example `logstat@default` with `/etc/logstat/default.yaml`.
 
-При нескольких инстансах на одном хосте:
+With several instances on one host:
 
-- у каждого конфига **свой** `lock_file`, иначе второй инстанс не стартует из-за `flock`. Юнит выдаёт каждому инстансу свой рантайм-каталог (`RuntimeDirectory=logstat/%i` → `/run/logstat/<инстанс>`), поэтому естественный путь — `/run/logstat/<инстанс>/logstat.lock`. Это единственный каталог, доступный демону на запись при `ProtectSystem=strict`;
-- при `logging.output: file` — **свой** `logging.file` у каждого;
-- если инстансы смотрят в **один и тот же** Redis (host/port/db), их наборы `actions` не должны пересекаться — иначе коллизия ключей (см. [Предупреждения оператору](#предупреждения-оператору)). Разный Redis или разный `db` снимают вопрос сами по себе.
+- every config needs its **own** `lock_file`, otherwise the second instance will not start because of `flock`. The unit gives each instance its own runtime directory (`RuntimeDirectory=logstat/%i` → `/run/logstat/<instance>`), which makes `/run/logstat/<instance>/logstat.lock` the natural path. It is also the only directory the daemon can write to under `ProtectSystem=strict`;
+- with `logging.output: file`, every instance needs its **own** `logging.file`;
+- if the instances point at the **same** Redis (host/port/db), their `actions` sets must not overlap, otherwise the keys collide (see [Operator warnings](#operator-warnings)). A different Redis or a different `db` settles the question by itself.
 
-Раскатка — через Salt (`file.managed` для пакета и per-инстансных конфигов + `service.running` по списку инстансов) либо установка `.deb` / `.rpm` из GitHub Release.
+Rollout goes either through Salt (`file.managed` for the package and the per-instance configs plus `service.running` over the list of instances) or by installing the `.deb` / `.rpm` from a GitHub Release.
 
-## Логирование самого демона
+## The daemon's own log
 
-Демон ведёт собственный лог: старт и стоп, загруженный конфиг, факт и результат каждого флаша, срабатывание сброса, недоступность Redis и реконнект, ротация лог-файла, ошибки. Формат человекочитаемый — таймстамп, уровень, сообщение, атрибуты:
+The daemon keeps its own log: start and stop, the loaded config, the fact and the result of every flush, a reset firing, Redis being unavailable and reconnecting, log rotation, errors. The format is human readable — timestamp, level, message, attributes:
 
 ```
-2026-08-18T15:04:05+03:00 INFO  starting log_path=/var/log/app.log actions=4 flush_interval=10 ...
-2026-08-18T15:04:15+03:00 WARN  redis unavailable, buffering in memory op=incrby error="..."
+2026-08-19T15:04:05+03:00 INFO  starting log_path=/var/log/app.log actions=4 flush_interval=10 ...
+2026-08-19T15:04:15+03:00 WARN  redis unavailable, buffering in memory op=incrby error="..."
 ```
 
-События по отдельным строкам лога пишутся только на уровне `debug` — на высоком RPS это слишком шумно.
+Events about individual log lines are only written at `debug` level — at a high request rate they are far too noisy.
 
-- `logging.output: journald` (дефолт) — вывод в **stderr**, откуда systemd складывает в journald: `journalctl -u logstat@<инстанс>`. Отдельной интеграции с протоколом journald не требуется.
-- `logging.output: file` — вывод в файл `logging.file`. Ротацию этого файла обеспечивает внешний logrotate; демон переоткрывает свой лог по `SIGHUP`, что для logrotate удобно оформить как `postrotate systemctl reload logstat@<инстанс>` (юнит содержит `ExecReload=/bin/kill -HUP $MAINPID`).
+- `logging.output: journald` (the default) writes to **stderr**, from where systemd collects it into journald: `journalctl -u logstat@<instance>`. No separate journald protocol integration is required.
+- `logging.output: file` writes to the file given by `logging.file`. Rotating that file is the job of an external logrotate; the daemon reopens its log on `SIGHUP`, which is convenient to wire up as `postrotate systemctl reload logstat@<instance>` (the unit carries `ExecReload=/bin/kill -HUP $MAINPID`).
 
-  Важно: при `ProtectSystem=strict` каталог `/var/log` доступен только для чтения. Чтобы писать туда, добавьте в юнит (лучше через drop-in) `LogsDirectory=logstat` — systemd создаст `/var/log/logstat`, доступный на запись:
+  Note that under `ProtectSystem=strict` the `/var/log` directory is read-only. To write there, add `LogsDirectory=logstat` to the unit, preferably through a drop-in: systemd will create a writable `/var/log/logstat`.
 
   ```sh
   sudo systemctl edit logstat@app1.service
@@ -230,53 +232,53 @@ journalctl -u logstat@app1 -f
   # LogsDirectory=logstat
   ```
 
-## Права на чтение лога
+## Read permissions on the log
 
-Демон работает под непривилегированным пользователем `logstat` с systemd-хардненингом (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`). Группа, нужная для чтения лога, зависит от владельца файла: для nginx это обычно `adm` (в юните так и стоит), для другого ПО `SupplementaryGroups` надо подогнать под конкретный лог — иногда демону хватит обычных прав, если файл читаем всем.
+The daemon runs as the unprivileged user `logstat` with systemd hardening (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`). Which group is needed to read the log depends on the file's owner: for nginx it is usually `adm`, which is what the unit ships with; for other software `SupplementaryGroups` has to be adjusted to the specific log — sometimes plain permissions are enough, if the file is world readable.
 
 ```sh
-ls -l /var/log/app.log            # посмотреть владельца и группу
+ls -l /var/log/app.log            # check the owner and the group
 sudo systemctl edit logstat@app1.service
 # [Service]
 # SupplementaryGroups=
-# SupplementaryGroups=<нужная группа>
+# SupplementaryGroups=<the required group>
 ```
 
-## Предупреждения оператору
+## Operator warnings
 
-**Префиксные пересечения в `actions`.** Матчинг подстрочный, поэтому слово, являющееся частью другого слова из списка, инкрементит оба счётчика: `getStatus` совпадёт и внутри гипотетического `getStatusExtended`. Среди четырёх дефолтных слов пересечений нет (ни одно не является подстрокой другого). При добавлении новых слов это надо проверять — при старте демон выдаёт предупреждение в лог на каждую такую пару, но работать не отказывается.
+**Prefix overlaps in `actions`.** Matching is substring based, so a word that is part of another word from the list increments both counters: `getStatus` also matches inside a hypothetical `getStatusExtended`. The four default words do not overlap (none of them is a substring of another). Adding new words calls for a check — at startup the daemon logs a warning for every such pair, but it does not refuse to run.
 
-**Потенциальная коллизия ключей.** Ключи содержат только `<host>` и `<action>`. Коллизия возможна ровно в одном сценарии: несколько инстансов на одном хосте, у которых в конфиге **один и тот же** Redis (host/port/db) **и** пересекающиеся `actions` — тогда они пишут в общий ключ и затирают друг друга. Обычно этого не бывает: у разных конфигов, как правило, и Redis разный (свой host/db в каждом), а если Redis один — достаточно непересекающихся наборов `actions`. Софт этот случай **не предотвращает**, это ответственность оператора.
+**A possible key collision.** The keys contain only `<host>` and `<action>`. A collision is possible in exactly one scenario: several instances on one host configured with the **same** Redis (host/port/db) **and** overlapping `actions` — then they write to a shared key and overwrite each other. This is normally not the case: different configs usually mean a different Redis (its own host/db in each), and if Redis really is shared, non-overlapping `actions` sets are enough. The software does **not** prevent this case; it is the operator's responsibility.
 
-**Строки за время простоя не досчитываются.** Оффсет файла между рестартами не персистится сознательно (ради простоты): после рестарта демон встаёт в конец файла, а счётчик продолжается с текущего значения в Redis.
+**Lines written while the daemon was down are not counted.** The file offset is deliberately not persisted across restarts, for the sake of simplicity: after a restart the daemon positions itself at the end of the file and the counter continues from its current value in Redis.
 
-**Ротация в режиме `copytruncate` принципиально гоночная.** Между копированием и усечением файла ПО-источник может успеть записать строки, которые пропадут для всех читателей. Если ротацией управляете вы — предпочтительнее режим `create`.
+**Rotation in `copytruncate` mode is inherently racy.** Between the copy and the truncation the source software can write lines that are lost for every reader. If rotation is under your control, `create` mode is preferable.
 
-## Удаление пакета
+## Removing the package
 
-Enable-симлинки инстансов (`/etc/systemd/system/*.wants/logstat@<имя>.service`) создаёт администратор командой `systemctl enable`, пакету они не принадлежат и сами не удалятся. Поэтому:
+The instance enable symlinks (`/etc/systemd/system/*.wants/logstat@<name>.service`) are created by the administrator through `systemctl enable`, do not belong to the package and would not be removed by themselves. Therefore:
 
-- prerm останавливает все запущенные инстансы (`systemctl stop 'logstat@*.service'`) — только при реальном удалении, при обновлении инстансы не трогаются и поднимаются в postinstall;
-- postrm при удалении пакета проходит по `.wants`-каталогам, снимает осиротевшие симлинки и делает `daemon-reload`.
+- prerm stops every running instance (`systemctl stop 'logstat@*.service'`) — only on an actual removal; on an upgrade the instances are left alone and are brought back by postinstall;
+- on removal, postrm walks the `.wants` directories, drops the orphaned symlinks and runs `daemon-reload`.
 
-Для чистоты всё же лучше сделать это самому до удаления:
+For a clean removal it is still better to do it yourself beforehand:
 
 ```sh
 sudo systemctl disable --now logstat@app1.service
-sudo apt-get remove logstat     # или: sudo rpm -e logstat
+sudo apt-get remove logstat     # or: sudo rpm -e logstat
 ```
 
-Пользователь `logstat` и файлы `/etc/logstat/*.yaml`, созданные администратором, при удалении не трогаются.
+The `logstat` user and the `/etc/logstat/*.yaml` files created by the administrator are left in place.
 
-## Тесты
+## Tests
 
 ```sh
 make test     # go test -race ./...
-make cover    # + профиль покрытия и итоговая цифра
+make cover    # plus a coverage profile and the resulting number
 ```
 
-Внешние сервисы не нужны: Redis подменяется на [miniredis](https://github.com/alicebob/miniredis), лог-файлы создаются во временных каталогах. Покрыты матчинг (подстрока, регистрозависимость, счёт по строке, префиксные пересечения), парсер и валидатор конфига, формирование ключей и форматной строки, сборка `lines=<N>` из ответа `INCRBY`, режим `heartbeat_key: false`, расчёт времени следующего срабатывания cron-расписаний, tail с обеими схемами ротации, старт при отсутствующем лог-файле, поведение при недоступном Redis и досброс после восстановления, сброс счётчиков (и напрямую, и через планировщик на расписании «каждую секунду», без ожидания реального cron), фильтрация уровней логирования и переоткрытие лог-файла, единственность экземпляра через `flock` и graceful shutdown по реальному `SIGTERM` в отдельном процессе.
+No external services are needed: Redis is replaced by [miniredis](https://github.com/alicebob/miniredis) and log files are created in temporary directories. The suite covers matching (substring, case sensitivity, per-line counting, prefix overlaps), the config parser and validator, key and value formatting, assembling `lines=<N>` from the `INCRBY` reply, the `heartbeat_key: false` mode, computing the next firing time of cron schedules, tailing across both rotation schemes, starting with the log file absent, behaviour with Redis unavailable and catching up after recovery, resetting the counters (both directly and through the scheduler on an every-second schedule, without waiting for real cron), log level filtering and log file reopening, single-instance enforcement through `flock`, and a graceful shutdown on a real `SIGTERM` in a separate process.
 
-## Лицензия
+## License
 
-Apache License 2.0 — см. [LICENSE](LICENSE) и [NOTICE](NOTICE).
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
