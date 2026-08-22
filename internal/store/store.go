@@ -252,10 +252,17 @@ func (s *Store) Counters(ctx context.Context, actions []string) (map[string]int6
 	if err != nil {
 		return nil, fmt.Errorf("read counters: %w", err)
 	}
+	// MGET answers one value per key. Checking that instead of trusting it keeps
+	// a protocol surprise (a proxy in front of Redis, say) an error rather than
+	// a panic in the middle of a scrape.
+	if len(values) != len(actions) {
+		return nil, fmt.Errorf("read counters: got %d values for %d keys", len(values), len(actions))
+	}
 
 	out := make(map[string]int64, len(actions))
 	var malformed []string
-	for i, v := range values {
+	for i := range actions {
+		v := values[i]
 		if v == nil {
 			continue
 		}

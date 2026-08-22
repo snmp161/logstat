@@ -17,9 +17,15 @@ GO       ?= go
 ARCHES   ?= amd64 arm64
 GOBIN    := $(shell $(GO) env GOPATH)/bin
 
+# Build-time helpers are pinned, and the workflows install the same versions.
+# "latest" would mean that a project nobody is touching goes red the day a
+# linter adds a check — and the release workflow lints before it publishes.
+GOLANGCI_VERSION ?= v2.12.2
+NFPM_VERSION     ?= v2.46.0
+
 export CGO_ENABLED=0
 
-.PHONY: all build build-all test test-short cover lint fmt vet package clean tools help
+.PHONY: all build build-all test test-short fuzz soak cover lint fmt vet package clean tools help
 
 all: lint test build
 
@@ -42,6 +48,16 @@ test:
 ## test-short: skip the slow integration tests
 test-short:
 	$(GO) test -short -timeout 5m ./...
+
+## fuzz: fuzz the config parser and validator (FUZZTIME=1m by default)
+FUZZTIME ?= 1m
+fuzz:
+	$(GO) test ./internal/config/ -run FuzzParseAndValidate \
+		-fuzz FuzzParseAndValidate -fuzztime $(FUZZTIME)
+
+## soak: run a release candidate against a real log and Redis (DURATION=10m)
+soak:
+	./scripts/soak.sh
 
 ## cover: test suite with a coverage profile and a per-function summary
 cover:
@@ -84,10 +100,10 @@ package: build-all
 	@rm -rf $(DIST)/pkgroot
 	@ls -1 $(DIST)/*.deb $(DIST)/*.rpm
 
-## tools: install the build-time helpers into GOPATH/bin
+## tools: install the pinned build-time helpers into GOPATH/bin
 tools:
-	$(GO) install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
-	$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+	$(GO) install github.com/goreleaser/nfpm/v2/cmd/nfpm@$(NFPM_VERSION)
+	$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION)
 
 ## clean: remove build output
 clean:

@@ -6,12 +6,22 @@ on:
     tags-ignore: ["v*"]     # tags are handled by release.yml
   pull_request:
   workflow_dispatch:
+  # A canary for a project that can sit untouched for months: a dependency, the
+  # toolchain or a runner image will eventually break the build, and it is
+  # better to learn that on a Monday than on the day a fix has to ship.
+  schedule:
+    - cron: "17 6 * * 1"
 
 permissions:
   contents: read
 
 env:
   GO_VERSION: "1.25"
+  # Pinned, and the same versions the Makefile installs. With "latest" a new
+  # linter release turns this red without a commit, and release.yml lints before
+  # it publishes — that red would land on a tag.
+  GOLANGCI_VERSION: "v2.12.2"
+  NFPM_VERSION: "v2.46.0"
 
 jobs:
   lint:
@@ -41,7 +51,7 @@ jobs:
       # version tracks the Go toolchain used here and the local `make lint`.
       - name: golangci-lint
         run: |
-          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+          go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_VERSION}"
           "$(go env GOPATH)/bin/golangci-lint" run --timeout=5m
 
   test:
@@ -119,7 +129,7 @@ jobs:
           cache: true
 
       - name: install nfpm
-        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+        run: go install "github.com/goreleaser/nfpm/v2/cmd/nfpm@${NFPM_VERSION}"
 
       - name: build packages
         run: |
@@ -140,3 +150,119 @@ jobs:
             dist/*.deb
             dist/*.rpm
           if-no-files-found: error
+
+  # Everything below the binary — the maintainer scripts, the unit file, the
+  # conffile handling — is shell that no Go test can reach. The runner is a real
+  # VM with systemd, so the package gets installed, started, upgraded over
+  # itself and removed, the way an operator would.
+  install-deb:
+    name: install (deb + systemd)
+    runs-on: ubuntu-latest
+    needs: package
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist
+
+      - name: install redis
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq redis-server
+          redis-cli ping
+
+      - name: install the package
+        run: |
+          sudo apt-get install -y "./$(ls dist/*_amd64.deb)"
+          test -x /usr/bin/logstat
+          test -f /etc/logstat/default.yaml
+          test -f /lib/systemd/system/logstat@.service
+          getent passwd logstat          # postinstall created the service user
+          logstat version
+
+      - name: configure an instance
+        run: |
+          sudo install -m 0644 /dev/null /var/log/logstat-ci.log
+          sudo tee /etc/logstat/ci.yaml >/dev/null <<'YAML'
+          log_path: /var/log/logstat-ci.log
+          actions: [get-number, get-sms]
+          flush_interval: 1
+          lock_file: /run/logstat/ci/logstat.lock
+          redis:
+            db: 14
+            ttl: 300
+          metrics:
+            enabled: true
+            listen: 127.0.0.1:9843
+            path: /metrics
+          YAML
+
+      - name: start it
+        run: |
+          sudo systemctl enable --now logstat@ci
+          for _ in $(seq 30); do
+            systemctl is-active --quiet logstat@ci && break
+            sleep 1
+          done
+          systemctl is-active --quiet logstat@ci || {
+            sudo journalctl -u logstat@ci --no-pager
+            exit 1
+          }
+
+      - name: count something
+        run: |
+          echo 'a get-number and a get-sms' | sudo tee -a /var/log/logstat-ci.log >/dev/null
+          for _ in $(seq 30); do
+            [ "$(redis-cli -n 14 get "logstat:counter:$(hostname -s):get-number")" = "1" ] && break
+            sleep 1
+          done
+          test "$(redis-cli -n 14 get "logstat:counter:$(hostname -s):get-number")" = "1"
+          curl -sf http://127.0.0.1:9843/metrics | grep -q '^logstat_redis_up 1$'
+          curl -sf http://127.0.0.1:9843/ | grep -q "get-number"
+
+      - name: upgrade over the running instance
+        run: |
+          echo '# edited by the operator' | sudo tee -a /etc/logstat/default.yaml >/dev/null
+          sudo apt-get install -y --reinstall "./$(ls dist/*_amd64.deb)"
+          # A conffile the operator touched survives the upgrade,
+          grep -q 'edited by the operator' /etc/logstat/default.yaml
+          # and the instance is back on the new binary rather than left dead.
+          for _ in $(seq 30); do
+            systemctl is-active --quiet logstat@ci && break
+            sleep 1
+          done
+          systemctl is-active --quiet logstat@ci
+
+      - name: remove it
+        run: |
+          sudo apt-get remove -y logstat
+          ! systemctl is-active --quiet logstat@ci          # preremove stopped it
+          test ! -e /usr/bin/logstat
+          # postremove dropped the enable symlink the operator created, which
+          # would otherwise dangle now that the template unit is gone.
+          test ! -e /etc/systemd/system/multi-user.target.wants/logstat@ci.service
+          ! ls /etc/systemd/system/*.wants/logstat@*.service 2>/dev/null
+
+  # The rpm never sees a Debian box, and its scriptlets differ in how they are
+  # called ($1 is a count, not a word). A container is enough to prove they run
+  # and that the files land where the unit expects them.
+  install-rpm:
+    name: install (rpm)
+    runs-on: ubuntu-latest
+    needs: package
+    container: fedora:41
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist
+
+      - name: install and remove the package
+        run: |
+          dnf install -y -q ./dist/*.x86_64.rpm
+          test -x /usr/bin/logstat
+          test -f /etc/logstat/default.yaml
+          test -f /usr/lib/systemd/system/logstat@.service
+          logstat version
+          dnf remove -y -q logstat
+          test ! -e /usr/bin/logstat

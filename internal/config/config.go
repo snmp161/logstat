@@ -161,6 +161,11 @@ func Load(path string) (cfg *Config, warnings []string, err error) {
 // It returns warnings for suspicious but legal setups and an error for fatal
 // ones. Every check runs: a config with three typos reports all three at once
 // instead of turning the fix into a restart-per-typo loop.
+//
+// It also normalises what it can, which today means dropping duplicate actions.
+// That makes the call idempotent in its verdict but not in its warnings: the
+// second run has no duplicates left to complain about. Load calls it once, and
+// the daemon runs on the normalised config.
 func (c *Config) Validate() ([]string, error) {
 	var warnings []string
 	var errs []error

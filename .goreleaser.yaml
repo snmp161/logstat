@@ -119,6 +119,21 @@ release:
     The integer counters `logstat:counter:<host>:<action>` are never rewritten by
     an upgrade: whatever was accumulated keeps counting from its current value.
 
+    **Coming from v0.3.0?** Nothing to do. v0.4.0 adds case-insensitive matching
+    (`case_sensitive`) and a Prometheus exporter with a status page (`metrics`),
+    and every new option defaults to the behaviour you already have: matching
+    stays case-sensitive and no port is opened. Both are opt-in, one line each:
+
+    ```yaml
+    case_sensitive: no       # match GET-NUMBER and Get-Number as well
+    metrics:
+      enabled: true          # exporter on 127.0.0.1:9843, status page on /
+    ```
+
+    With several instances on one host, give each its own `metrics.listen`: a
+    port already in use is a fatal startup error, exactly like a shared
+    `lock_file`.
+
     **Coming from v0.2.0 or earlier?** Since v0.3.0 the keys carry an expiry:
     `redis.ttl` defaults to `86400` (one day). It is refreshed on every flush, so
     the keys of a running instance never expire — they only disappear about a day

@@ -1,0 +1,22 @@
+# Frozen is not the same as safe: go-redis and client_golang will get security
+# fixes, and the actions used here get deprecated. Monthly is the cadence a
+# maintenance-mode project can actually keep up with — often enough that a CVE
+# does not sit for a year, rare enough that the repository is not a PR treadmill.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      # One PR per month for everything that only moved a patch version: those
+      # are read in a minute and merged on a green build.
+      patch-updates:
+        update-types: ["patch"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2

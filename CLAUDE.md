@@ -13,9 +13,16 @@ make build        # static binary into dist/ (CGO_ENABLED=0, version via ldflags
 make test         # full suite with -race
 make test-short   # skips the slow integration tests (they tail real files for seconds)
 make cover        # coverage profile plus a total
-make lint         # gofmt -l, go vet, golangci-lint (make tools installs the linter and nfpm)
+make fuzz         # fuzz config.Parse + Validate, FUZZTIME=1m
+make soak         # scripts/soak.sh: real log, real Redis, real clock, DURATION=10m
+make lint         # gofmt -l, go vet, golangci-lint (make tools installs the pinned tools)
 make package      # .deb and .rpm through nfpm
 ```
+
+Tool versions are pinned in the Makefile (`GOLANGCI_VERSION`, `NFPM_VERSION`) and
+repeated in the workflows, and the linter set is fixed in `.golangci.yml`. Keep
+them in step, and keep them buildable with the Go version in `go.mod`: the newest
+golangci-lint and nfpm already require a newer toolchain than this project pins.
 
 `make test` fails locally with "-race requires cgo" because the Makefile exports `CGO_ENABLED=0` for the static build. Run the race suite directly:
 
@@ -26,7 +33,9 @@ go test ./internal/metrics/ -run TestStatusPageOnTheRoot -v   # single test
 
 No external services are needed: Redis is `miniredis`, log files are created in `t.TempDir()`.
 
-CI runs lint, `go test -race`, a build matrix (linux/amd64 + arm64) and packaging on every push. A `v*` tag is what triggers a release (GoReleaser); pushing to `main` does not.
+CI runs lint, `go test -race`, a build matrix (linux/amd64 + arm64), packaging, and two jobs that install what was packaged — the `.deb` on the runner itself (systemd, template unit, upgrade over itself, removal with the maintainer scripts checked) and the `.rpm` in a Fedora container. It also runs weekly on a schedule, as a canary for a repository that may sit untouched for months. A `v*` tag is what triggers a release (GoReleaser); pushing to `main` does not.
+
+The project is in maintenance mode: no new features, and the surface deliberately does not grow. Before proposing one, read the non-goals in the specification.
 
 ## Architecture
 

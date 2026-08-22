@@ -8,6 +8,14 @@ The daemon is tied neither to nginx nor to any log format: it works on raw lines
 
 Implemented in Go as a static binary (`CGO_ENABLED=0`), configured through YAML.
 
+**Project status: feature-complete, maintenance mode.** logstat does one thing —
+count code words in one log file and keep the totals in Redis — and it does it.
+New features are not planned: multiple logs in one process, TLS to Redis,
+Sentinel or Cluster support, pushing metrics and reloading the config on the fly
+are all [deliberately out of scope](docs/specification.md). Bug reports and
+security fixes are welcome; the reasoning behind every design decision lives in
+[`docs/specification.md`](docs/specification.md), which is written in Russian.
+
 - [How it works](#how-it-works)
 - [Redis keys](#redis-keys)
   - [Key expiry](#key-expiry)
@@ -23,6 +31,7 @@ Implemented in Go as a static binary (`CGO_ENABLED=0`), configured through YAML.
 - [Read permissions on the log](#read-permissions-on-the-log)
 - [Operator warnings](#operator-warnings)
 - [Removing the package](#removing-the-package)
+- [When the counter stops growing](#when-the-counter-stops-growing)
 - [Tests](#tests)
 - [License](#license)
 
@@ -225,9 +234,11 @@ make build          # static binary for the host architecture → dist/logstat
 make build-all      # linux/amd64 + linux/arm64 → dist/logstat_linux_<arch>/logstat
 make test           # go test -race ./...
 make cover          # tests with a coverage profile
+make fuzz           # fuzz the config parser (FUZZTIME=1m)
+make soak           # long run against a live Redis (DURATION=10m)
 make lint           # gofmt + go vet + golangci-lint
 make package        # .deb and .rpm for both architectures (needs nfpm)
-make tools          # install nfpm and golangci-lint into GOPATH/bin
+make tools          # install the pinned nfpm and golangci-lint into GOPATH/bin
 make clean
 make help
 ```
@@ -457,11 +468,43 @@ sudo apt-get remove logstat     # or: sudo rpm -e logstat
 
 The `logstat` user and the `/etc/logstat/*.yaml` files created by the administrator are left in place.
 
+## When the counter stops growing
+
+A checklist for the person on duty, cheapest check first. Everything below is
+read-only.
+
+1. **Is the daemon running?** `systemctl status logstat@<instance>` — the unit
+   restarts on its own, so a crash loop shows up as a rising restart counter.
+2. **Is it reading the file it should?** The startup line names the path:
+   `journalctl -u logstat@<instance> | grep starting`. A daemon waiting for a
+   file that never appeared logs `log file does not exist yet`.
+3. **Are lines arriving at all?** With the exporter on, `logstat_lines_read_total`
+   grows even when nothing matches. If it is flat, the daemon reads no lines —
+   check the log source, the rotation, and the read permissions (`SupplementaryGroups`).
+4. **Do the lines match?** Compare `logstat_matched_lines_total` with
+   `logstat_lines_read_total`; a spelling or a case mismatch is the usual reason
+   for one growing and the other not ([case sensitivity](#case-sensitivity)).
+   `logging.level: debug` logs every matching line, which settles it — at the
+   price of one record per line.
+5. **Is the buffer stuck?** A rising `logstat_pending_increments` with a flat
+   `logstat_redis_counter` means the lines are counted but do not reach Redis:
+   look at `logstat_redis_up` and at the `redis unavailable` warning in the log.
+6. **Did somebody else zero the counter?** A `logstat_redis_counter` that drops
+   to zero off schedule is either an external `logstat clear`, a key that
+   expired ([key expiry](#key-expiry)), or two instances sharing one Redis and
+   one set of `actions` ([operator warnings](#operator-warnings)).
+
+Without the exporter the same questions are answered by
+`redis-cli get logstat:counter:<host>:<action>` over a minute and by the daemon
+log at `debug`.
+
 ## Tests
 
 ```sh
-make test     # go test -race ./...
-make cover    # plus a coverage profile and the resulting number
+make test               # go test -race ./...
+make cover              # plus a coverage profile and the resulting number
+make fuzz               # fuzz the config parser, FUZZTIME=1m by default
+make soak               # a release candidate against a real log, Redis and clock
 ```
 
 No external services are needed: Redis is replaced by [miniredis](https://github.com/alicebob/miniredis) and log files are created in temporary directories. The suite covers matching (substring, both case modes, per-line counting, prefix overlaps), the config parser and validator (including the `case_sensitive` default, its warnings and an end-to-end run in the case-insensitive mode), key and value formatting, assembling `lines=<N>` from the `INCRBY` reply, the `heartbeat_key: false` mode, setting and renewing the TTL on both keys (including an abandoned key expiring and the expiry being cleared with `ttl: 0`), computing the next firing time of cron schedules, tailing across both rotation schemes, starting with the log file absent, behaviour with Redis unavailable and catching up after recovery, resetting the counters (both directly and through the scheduler on an every-second schedule, without waiting for real cron), log level filtering and log file reopening, single-instance enforcement through `flock`, and a graceful shutdown on a real `SIGTERM` in a separate process. The exporter is covered from both ends: the collector against a fake clock (uptime, every config value, the per-word series starting at zero, the totals surviving a drain of the buffer, the password never being rendered) and the endpoint over real HTTP (`200` on the configured path, the status page on the root and `404` elsewhere, values that follow miniredis, `logstat_redis_up 0` with Redis down, no socket at all when disabled, a taken port failing the start, and an exporter that dies mid-run taking the daemon down with it).

@@ -9,6 +9,10 @@ permissions:
 
 env:
   GO_VERSION: "1.25"
+  # Pinned for the same reason as in ci.yml, and it matters more here: this job
+  # lints before it publishes, so an unpinned linter can fail a tag build months
+  # after the code was written.
+  GOLANGCI_VERSION: "v2.12.2"
 
 jobs:
   verify:
@@ -33,7 +37,7 @@ jobs:
 
       - name: golangci-lint
         run: |
-          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+          go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_VERSION}"
           "$(go env GOPATH)/bin/golangci-lint" run --timeout=5m
 
       - name: go test -race

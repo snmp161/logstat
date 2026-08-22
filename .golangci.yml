@@ -1,0 +1,39 @@
+# Pinned linter set. The version of golangci-lint is pinned too (see the
+# Makefile and the workflows): on a project that is expected to sit untouched
+# for long stretches, "latest" means a new release eventually adds a check and
+# turns the build red without a single commit — and the release workflow lints
+# before it publishes, so that red would land on a tag.
+version: "2"
+
+linters:
+  # The standard set is errcheck, govet, ineffassign, staticcheck and unused.
+  default: standard
+  enable:
+    - bodyclose # an unclosed HTTP body leaks a connection; the exporter has both sides
+    - gosec # the daemon opens operator-provided paths and binds a port
+    - misspell # the documentation lives in comments, so typos land in the docs
+
+  settings:
+    gosec:
+      excludes:
+        # Permissions here are deliberate, not accidental: the config, the log
+        # and the lock file are operator-chosen paths, and their directories are
+        # 0755 because /var/log/logstat and /run/logstat are meant to be
+        # traversable by the monitoring side and by whoever reads the log.
+        - G301
+        - G302
+        - G306
+
+  exclusions:
+    rules:
+      # Tests reach for the unexported internals of their own package and open
+      # temporary files by construction; the security linter has nothing useful
+      # to say about that.
+      - path: _test\.go
+        linters:
+          - bodyclose
+          - gosec
+
+formatters:
+  enable:
+    - gofmt
