@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,6 +63,15 @@ type Reset struct {
 	Schedule string `yaml:"schedule"`
 }
 
+// Metrics configures the Prometheus exporter. It is off by default: an upgrade
+// must not open a listening socket where none was expected, and two instances
+// on one host would otherwise fight over the same port.
+type Metrics struct {
+	Enabled bool   `yaml:"enabled"`
+	Listen  string `yaml:"listen"`
+	Path    string `yaml:"path"`
+}
+
 // Config is the full daemon configuration.
 type Config struct {
 	LogPath string   `yaml:"log_path"`
@@ -75,6 +86,7 @@ type Config struct {
 	Redis         Redis   `yaml:"redis"`
 	Logging       Logging `yaml:"logging"`
 	Reset         Reset   `yaml:"reset"`
+	Metrics       Metrics `yaml:"metrics"`
 }
 
 // Default returns the configuration used when the YAML file omits fields.
@@ -100,6 +112,11 @@ func Default() Config {
 		Reset: Reset{
 			Enabled:  true,
 			Schedule: "0 0 * * *",
+		},
+		Metrics: Metrics{
+			Enabled: false,
+			Listen:  "127.0.0.1:9843",
+			Path:    "/metrics",
 		},
 	}
 }
@@ -214,8 +231,38 @@ func (c *Config) Validate() ([]string, error) {
 	if _, err := ParseSchedule(c.Reset.Schedule); err != nil {
 		return warnings, err
 	}
+	// Same reasoning for the exporter: checked whether or not it is enabled.
+	if err := c.Metrics.validate(); err != nil {
+		return warnings, err
+	}
 
 	return warnings, nil
+}
+
+// validate checks the exporter address and path without binding anything.
+func (m Metrics) validate() error {
+	listen := strings.TrimSpace(m.Listen)
+	if listen == "" {
+		return errors.New("metrics.listen must not be empty")
+	}
+	// An empty host is legal and means every interface; the port is not.
+	_, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return fmt.Errorf("metrics.listen %q must be host:port: %w", m.Listen, err)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return fmt.Errorf("metrics.listen %q must end in a numeric port", m.Listen)
+	}
+	// Port 0 would let the kernel pick a random port, which nothing could scrape.
+	if n < 1 || n > 65535 {
+		return fmt.Errorf("metrics.listen port must be in 1..65535, got %d", n)
+	}
+
+	if !strings.HasPrefix(m.Path, "/") {
+		return fmt.Errorf("metrics.path must start with a slash, got %q", m.Path)
+	}
+	return nil
 }
 
 // ParseSchedule parses a strictly standard 5-field cron expression

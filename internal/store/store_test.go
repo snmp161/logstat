@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -220,6 +221,61 @@ func TestIncrAndSetValue(t *testing.T) {
 
 	if v, err := st.Get(ctx, "get-sms"); err != nil || v != 7 {
 		t.Errorf("Get = %d, %v; want 7, nil", v, err)
+	}
+}
+
+// Counters is the read side used by the metrics exporter: one round trip for
+// every action, and a key that does not exist is simply absent from the result.
+func TestCounters(t *testing.T) {
+	st, mr := newStore(t)
+	ctx := context.Background()
+
+	actions := []string{"get-number", "get-sms", "getStatus"}
+	if _, err := st.Incr(ctx, "get-number", 7); err != nil {
+		t.Fatalf("Incr: %v", err)
+	}
+	if err := mr.Set(CounterKey(host, "get-sms"), "0"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.Counters(ctx, actions)
+	if err != nil {
+		t.Fatalf("Counters: %v", err)
+	}
+	want := map[string]int64{"get-number": 7, "get-sms": 0}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Counters = %v, want %v: a missing key is a missing entry, not a zero", got, want)
+	}
+
+	// An empty action list is not a round trip at all.
+	if got, err := st.Counters(ctx, nil); err != nil || len(got) != 0 {
+		t.Fatalf("Counters(nil) = %v, %v; want an empty result and no error", got, err)
+	}
+
+	// A value that is not an integer belongs to something else with the same
+	// key; report it instead of silently exporting a wrong number.
+	if err := mr.Set(CounterKey(host, "getStatus"), "not-a-number"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Counters(ctx, actions); err == nil {
+		t.Error("Counters must fail on a value that is not an integer")
+	}
+}
+
+func TestCountersFailWhenRedisIsDown(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow: waits for the go-redis dial retries")
+	}
+	st, mr := newStore(t)
+	ctx := context.Background()
+
+	if _, err := st.Counters(ctx, []string{"a"}); err != nil {
+		t.Fatalf("Counters: %v", err)
+	}
+	mr.Close()
+
+	if _, err := st.Counters(ctx, []string{"a"}); err == nil {
+		t.Error("Counters must fail once Redis is gone")
 	}
 }
 

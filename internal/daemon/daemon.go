@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nxadm/tail"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/snmp161/logstat/internal/config"
 	"github.com/snmp161/logstat/internal/counter"
+	"github.com/snmp161/logstat/internal/metrics"
 	"github.com/snmp161/logstat/internal/store"
 )
 
@@ -44,6 +46,14 @@ type Daemon struct {
 	pendingResets map[string]bool
 	// redisDown avoids logging the same connection error on every flush.
 	redisDown bool
+
+	// started is when the process came up; the exporter reports it as uptime.
+	started time.Time
+	// version is shown on the status page of the exporter.
+	version string
+	// metricsAddr is the address the exporter bound, empty while it is not
+	// running. Read by tests and by anything wanting the effective port.
+	metricsAddr atomic.Pointer[string]
 }
 
 // Option customises a Daemon.
@@ -53,6 +63,12 @@ type Option func(*Daemon)
 // it to enable the six-field (seconds) parser.
 func WithCronOptions(opts ...cron.Option) Option {
 	return func(d *Daemon) { d.cronOpts = opts }
+}
+
+// WithVersion passes the build version through to the status page of the
+// metrics exporter.
+func WithVersion(v string) Option {
+	return func(d *Daemon) { d.version = v }
 }
 
 // New builds a daemon for cfg. The store and logger are supplied by the caller
@@ -65,6 +81,7 @@ func New(cfg *config.Config, lg *slog.Logger, st *store.Store, opts ...Option) *
 		cnt:               counter.New(cfg.Actions, cfg.CaseSensitive),
 		pendingHeartbeats: make(map[string]int64),
 		pendingResets:     make(map[string]bool),
+		started:           time.Now(),
 	}
 	for _, o := range opts {
 		o(d)
@@ -74,6 +91,15 @@ func New(cfg *config.Config, lg *slog.Logger, st *store.Store, opts ...Option) *
 
 // Counter exposes the in-memory buffer, for tests and diagnostics.
 func (d *Daemon) Counter() *counter.Counter { return d.cnt }
+
+// MetricsAddr returns the address the metrics exporter is listening on, or an
+// empty string when it is disabled or not up yet.
+func (d *Daemon) MetricsAddr() string {
+	if addr := d.metricsAddr.Load(); addr != nil {
+		return *addr
+	}
+	return ""
+}
 
 // Run tails the log file until ctx is cancelled, then performs a final flush.
 func (d *Daemon) Run(ctx context.Context) error {
@@ -89,7 +115,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 		"host", d.store.Host(),
 		"heartbeat_key", d.cfg.HeartbeatKey,
 		"reset_enabled", d.cfg.Reset.Enabled,
-		"reset_schedule", d.cfg.Reset.Schedule)
+		"reset_schedule", d.cfg.Reset.Schedule,
+		"metrics_enabled", d.cfg.Metrics.Enabled)
+
+	// The exporter binds before anything is read: a port already in use has to
+	// stop the daemon right away rather than after the first flush.
+	stopMetrics, err := d.startMetrics()
+	if err != nil {
+		return err
+	}
+	defer stopMetrics()
 
 	// An existing log file is opened at its end (tail -n0): what was written
 	// before the daemon started is history and must not be counted. A file that
@@ -174,6 +209,52 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.Reset(ctx)
 		}
 	}
+}
+
+// startMetrics brings the Prometheus exporter up and returns the function that
+// takes it down again. With the exporter disabled both are no-ops.
+//
+// Binding happens here, synchronously, so that an address already in use is
+// reported as a startup error: silently counting on without the metrics somebody
+// asked for in the config would show the monitoring side silence and let it
+// conclude that everything is fine.
+func (d *Daemon) startMetrics() (stop func(), err error) {
+	if !d.cfg.Metrics.Enabled {
+		d.log.Debug("metrics exporter disabled")
+		return func() {}, nil
+	}
+
+	collector := metrics.NewCollector(d.cfg, d.cnt, d.store, metrics.Options{
+		Start:   d.started,
+		Version: d.version,
+		Log:     d.log,
+	})
+	srv, err := metrics.NewServer(d.cfg.Metrics, collector, d.log)
+	if err != nil {
+		return nil, err
+	}
+
+	addr := srv.Addr()
+	d.metricsAddr.Store(&addr)
+
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		if err := srv.Serve(); err != nil {
+			d.log.Error("metrics exporter stopped", "error", err)
+		}
+	}()
+
+	return func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), opTimeout)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			d.log.Warn("metrics exporter shutdown failed", "error", err)
+		}
+		<-served
+		d.metricsAddr.Store(nil)
+		d.log.Debug("metrics exporter stopped", "addr", addr)
+	}, nil
 }
 
 // consume feeds lines from the tailer into the counter. It returns when the

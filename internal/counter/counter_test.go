@@ -248,6 +248,73 @@ func TestAccumulateAndDrain(t *testing.T) {
 	}
 }
 
+// The exporter needs a per-action view of both halves of the counter: the total
+// since the start, which only grows, and what is still waiting for a flush.
+func TestMatchedAndPendingByAction(t *testing.T) {
+	c := New(defaultActions, true)
+
+	// Every configured action is present from the start, at zero: "configured
+	// but never seen" must not look like "not configured" in the metrics.
+	zero := map[string]int64{"get-number": 0, "get-sms": 0, "getNumber": 0, "getStatus": 0}
+	if got := c.Matched(); !reflect.DeepEqual(got, zero) {
+		t.Fatalf("Matched of a fresh counter = %v, want %v", got, zero)
+	}
+	if got := c.PendingByAction(); !reflect.DeepEqual(got, zero) {
+		t.Fatalf("PendingByAction of a fresh counter = %v, want %v", got, zero)
+	}
+
+	c.ProcessLine("get-number")
+	c.ProcessLine("get-number and get-sms")
+	c.ProcessLine("nothing here")
+
+	want := map[string]int64{"get-number": 2, "get-sms": 1, "getNumber": 0, "getStatus": 0}
+	if got := c.Matched(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Matched = %v, want %v", got, want)
+	}
+	if got := c.PendingByAction(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("PendingByAction = %v, want %v", got, want)
+	}
+
+	// A flush empties the buffer but must not touch the totals: a Prometheus
+	// counter that fell back to zero every ten seconds would be useless.
+	c.Drain()
+	if got := c.Matched(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Matched after Drain = %v, want %v", got, want)
+	}
+	if got := c.PendingByAction(); !reflect.DeepEqual(got, zero) {
+		t.Fatalf("PendingByAction after Drain = %v, want %v", got, zero)
+	}
+
+	// A failed flush puts the increments back into the buffer; the totals must
+	// not count them a second time.
+	c.Restore(map[string]int64{"get-number": 2})
+	if got := c.Matched()["get-number"]; got != 2 {
+		t.Fatalf("Matched[get-number] after Restore = %d, want 2", got)
+	}
+	if got := c.PendingByAction()["get-number"]; got != 2 {
+		t.Fatalf("PendingByAction[get-number] after Restore = %d, want 2", got)
+	}
+}
+
+// The maps are snapshots: a caller (the metrics collector) may keep or mutate
+// them without disturbing the counter.
+func TestMatchedAndPendingAreSnapshots(t *testing.T) {
+	c := New([]string{"a"}, true)
+	c.ProcessLine("a")
+
+	matched := c.Matched()
+	matched["a"] = 99
+	pending := c.PendingByAction()
+	pending["a"] = 99
+
+	if got := c.Matched()["a"]; got != 1 {
+		t.Fatalf("Matched[a] = %d, want 1", got)
+	}
+	if got := c.PendingByAction()["a"]; got != 1 {
+		t.Fatalf("PendingByAction[a] = %d, want 1", got)
+	}
+}
+
 func TestRestoreAddsToWhatArrivedMeanwhile(t *testing.T) {
 	c := New(defaultActions, true)
 	c.ProcessLine("get-number")
@@ -304,6 +371,23 @@ func TestConcurrentProcessAndDrain(t *testing.T) {
 		}
 	}()
 
+	// A scraper reading the exporter's view while the writers and the drainer
+	// are busy: the metrics endpoint runs in its own goroutine in the daemon.
+	scraperDone := make(chan struct{})
+	go func() {
+		defer close(scraperDone)
+		for {
+			c.Matched()
+			c.PendingByAction()
+			c.Lines()
+			select {
+			case <-stop:
+				return
+			default:
+			}
+		}
+	}()
+
 	var writersWG sync.WaitGroup
 	for i := 0; i < writers; i++ {
 		writersWG.Add(1)
@@ -317,11 +401,17 @@ func TestConcurrentProcessAndDrain(t *testing.T) {
 	writersWG.Wait()
 	close(stop)
 	<-drainerDone
+	<-scraperDone
 
 	if total["get-number"] != writers*perWriter {
 		t.Errorf("get-number = %d, want %d", total["get-number"], writers*perWriter)
 	}
 	if total["get-sms"] != writers*perWriter {
 		t.Errorf("get-sms = %d, want %d", total["get-sms"], writers*perWriter)
+	}
+	// Whatever the drainer collected, the totals must agree with it.
+	matched := c.Matched()
+	if matched["get-number"] != total["get-number"] || matched["get-sms"] != total["get-sms"] {
+		t.Errorf("Matched = %v, want it to agree with the drained totals %v", matched, total)
 	}
 }

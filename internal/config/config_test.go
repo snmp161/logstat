@@ -50,6 +50,14 @@ func TestDefaults(t *testing.T) {
 	if !cfg.Reset.Enabled || cfg.Reset.Schedule != "0 0 * * *" {
 		t.Errorf("reset = %+v", cfg.Reset)
 	}
+	// The exporter stays off unless asked for: an upgrade must not start
+	// listening on a port nobody expected.
+	if cfg.Metrics.Enabled {
+		t.Error("metrics.enabled = true, want false by default")
+	}
+	if cfg.Metrics.Listen != "127.0.0.1:9843" || cfg.Metrics.Path != "/metrics" {
+		t.Errorf("metrics = %+v", cfg.Metrics)
+	}
 	if _, err := cfg.Validate(); err != nil {
 		t.Errorf("defaults must validate: %v", err)
 	}
@@ -101,6 +109,10 @@ logging:
 reset:
   enabled: false
   schedule: "*/30 * * * *"
+metrics:
+  enabled: true
+  listen: 0.0.0.0:9999
+  path: /internal/metrics
 `
 	cfg, err := Parse([]byte(yaml))
 	if err != nil {
@@ -126,6 +138,9 @@ reset:
 	}
 	if cfg.Reset.Enabled || cfg.Reset.Schedule != "*/30 * * * *" {
 		t.Errorf("reset = %+v", cfg.Reset)
+	}
+	if !cfg.Metrics.Enabled || cfg.Metrics.Listen != "0.0.0.0:9999" || cfg.Metrics.Path != "/internal/metrics" {
+		t.Errorf("metrics = %+v", cfg.Metrics)
 	}
 	if _, err := cfg.Validate(); err != nil {
 		t.Errorf("Validate: %v", err)
@@ -174,6 +189,13 @@ func TestValidateFatal(t *testing.T) {
 		{"bad schedule", func(c *Config) { c.Reset.Schedule = "every midnight" }, "reset.schedule"},
 		{"empty schedule", func(c *Config) { c.Reset.Schedule = "" }, "reset.schedule"},
 		{"six field schedule", func(c *Config) { c.Reset.Schedule = "0 0 0 * * *" }, "reset.schedule"},
+		{"empty metrics listen", func(c *Config) { c.Metrics.Listen = " " }, "metrics.listen"},
+		{"metrics listen without a port", func(c *Config) { c.Metrics.Listen = "127.0.0.1" }, "metrics.listen"},
+		{"metrics listen with a named port", func(c *Config) { c.Metrics.Listen = "127.0.0.1:http" }, "metrics.listen"},
+		{"metrics port zero", func(c *Config) { c.Metrics.Listen = "127.0.0.1:0" }, "metrics.listen"},
+		{"metrics port out of range", func(c *Config) { c.Metrics.Listen = "127.0.0.1:70000" }, "metrics.listen"},
+		{"empty metrics path", func(c *Config) { c.Metrics.Path = "" }, "metrics.path"},
+		{"metrics path without a slash", func(c *Config) { c.Metrics.Path = "metrics" }, "metrics.path"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -359,6 +381,40 @@ func TestValidateWarnsOnDuplicateActions(t *testing.T) {
 	}
 	if len(warnings) != 1 || !strings.Contains(warnings[0], "more than once") {
 		t.Fatalf("warnings = %v", warnings)
+	}
+}
+
+// The listen address and the path are checked whether or not the exporter is
+// enabled, exactly like reset.schedule: a typo must not wait for the day
+// somebody flips the flag. TestValidateFatal covers the errors on a Default()
+// config, which has metrics.enabled false — this pins the intent down.
+func TestMetricsAreValidatedEvenWhenDisabled(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		cfg := Default()
+		cfg.Metrics.Enabled = enabled
+		cfg.Metrics.Listen = "127.0.0.1"
+
+		if _, err := cfg.Validate(); err == nil {
+			t.Fatalf("enabled=%v: a listen address without a port must be an error", enabled)
+		}
+	}
+}
+
+func TestMetricsListenAcceptedForms(t *testing.T) {
+	// An empty host means every interface, which is legal and occasionally
+	// wanted; a name instead of an IP is resolved by the listener, not by us.
+	for _, listen := range []string{"127.0.0.1:9843", ":9843", "0.0.0.0:1", "[::1]:9843", "localhost:65535"} {
+		cfg := Default()
+		cfg.Metrics.Enabled = true
+		cfg.Metrics.Listen = listen
+
+		warnings, err := cfg.Validate()
+		if err != nil {
+			t.Errorf("listen %q must be valid: %v", listen, err)
+		}
+		if len(warnings) != 0 {
+			t.Errorf("listen %q warnings = %v, want none", listen, warnings)
+		}
 	}
 }
 

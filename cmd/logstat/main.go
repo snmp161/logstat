@@ -118,7 +118,7 @@ func cmdRun(args []string) int {
 		}
 	}()
 
-	if err := daemon.New(cfg, lg.Logger, st).Run(ctx); err != nil {
+	if err := daemon.New(cfg, lg.Logger, st, daemon.WithVersion(version)).Run(ctx); err != nil {
 		lg.Error("daemon failed", "error", err)
 		return 1
 	}

@@ -68,3 +68,15 @@ logging:
 reset:
   enabled: true          # false: only count, something external does the zeroing
   schedule: "0 0 * * *"  # standard 5-field cron; default is daily at midnight
+
+# Prometheus exporter: uptime, the configuration of this instance, the per-word
+# counters of this process and the per-word totals read from Redis on scrape.
+metrics:
+  enabled: false         # off by default: no port is opened unless asked for
+  listen: 127.0.0.1:9843 # host:port; loopback only unless you publish it
+                         # IMPORTANT: with several configs on one host the port
+                         # must be DIFFERENT for each — a taken port is a fatal
+                         # startup error, exactly like a taken lock_file
+  path: /metrics         # the exposition endpoint; the root of the same port
+                         # shows a human-readable status page, and every other
+                         # path answers 404

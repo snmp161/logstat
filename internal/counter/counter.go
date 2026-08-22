@@ -23,6 +23,10 @@ type Counter struct {
 
 	mu      sync.Mutex
 	pending map[string]int64
+	// matched is the monotonic total per action since the start. It is kept
+	// apart from pending because a flush empties the buffer, and a Prometheus
+	// counter that fell back to zero on every flush would be worthless.
+	matched map[string]int64
 	lines   int64
 }
 
@@ -35,6 +39,7 @@ func New(actions []string, caseSensitive bool) *Counter {
 		caseSensitive: caseSensitive,
 		needles:       make([]string, len(actions)),
 		pending:       make(map[string]int64, len(actions)),
+		matched:       make(map[string]int64, len(actions)),
 	}
 	for i, a := range c.actions {
 		if caseSensitive {
@@ -42,6 +47,9 @@ func New(actions []string, caseSensitive bool) *Counter {
 		} else {
 			c.needles[i] = strings.ToLower(a)
 		}
+		// Every configured action is reported from the start, at zero, so that
+		// "configured but never seen" does not look like "not configured".
+		c.matched[a] = 0
 	}
 	return c
 }
@@ -76,6 +84,7 @@ func (c *Counter) ProcessLine(line string) []string {
 	c.lines++
 	for _, a := range matched {
 		c.pending[a]++
+		c.matched[a]++
 	}
 	c.mu.Unlock()
 	return matched
@@ -105,6 +114,33 @@ func (c *Counter) Restore(deltas map[string]int64) {
 	for a, n := range deltas {
 		c.pending[a] += n
 	}
+}
+
+// Matched returns a snapshot of the per-action totals since the start. Every
+// configured action is present, unmatched ones with a zero. Restoring a failed
+// flush does not count its increments a second time: the totals are advanced by
+// ProcessLine only.
+func (c *Counter) Matched() map[string]int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]int64, len(c.matched))
+	for a, n := range c.matched {
+		out[a] = n
+	}
+	return out
+}
+
+// PendingByAction returns a snapshot of what is buffered, per action. Every
+// configured action is present, so a quiet action reads as a zero rather than
+// as a gap.
+func (c *Counter) PendingByAction() map[string]int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]int64, len(c.actions))
+	for _, a := range c.actions {
+		out[a] = c.pending[a]
+	}
+	return out
 }
 
 // Pending returns the total number of buffered increments across all actions.

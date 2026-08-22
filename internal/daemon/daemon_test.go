@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -721,6 +723,143 @@ func TestRunRejectsABadSchedule(t *testing.T) {
 	defer cancel()
 	if err := h.d.Run(ctx); err == nil {
 		t.Fatal("Run must fail on an unparsable schedule")
+	}
+}
+
+// --- integration level: the metrics exporter -------------------------------
+
+// waitMetricsAddr blocks until Run has bound the exporter and returns its
+// address. The port is picked by the kernel, so the test cannot know it upfront.
+func (h *harness) waitMetricsAddr(t *testing.T) string {
+	t.Helper()
+	var addr string
+	h.waitFor(t, "the metrics exporter to bind", func() bool {
+		addr = h.d.MetricsAddr()
+		return addr != ""
+	})
+	return addr
+}
+
+func httpGet(t *testing.T, url string) (int, string) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.StatusCode, string(body)
+}
+
+func TestRunServesMetrics(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: tails a real file over several seconds")
+	}
+	h := newHarness(t, func(c *config.Config) {
+		c.Poll = true
+		c.Metrics.Enabled = true
+	})
+	// Port 0 means "any free port", which is what a test needs and what the
+	// config validator rightly refuses from an operator, so it is set past the
+	// validation rather than through the config.
+	h.cfg.Metrics.Listen = "127.0.0.1:0"
+
+	stop := runDaemon(t, h.d)
+	addr := h.waitMetricsAddr(t)
+	h.waitTailStarted(t)
+	waitTailAttached(t, h)
+
+	appendLines(t, h.cfg.LogPath, "one get-number", "another get-number")
+	h.waitFor(t, "the lines to reach Redis", func() bool { return h.counter(t, "get-number") == "2" })
+
+	code, body := httpGet(t, "http://"+addr+"/metrics")
+	if code != 200 {
+		t.Fatalf("GET /metrics = %d, want 200", code)
+	}
+	for _, want := range []string{
+		`logstat_matched_lines_total{action="get-number"} 2`,
+		`logstat_redis_counter{action="get-number"} 2`,
+		"logstat_redis_up 1",
+		"logstat_config_info{",
+		"logstat_config_flush_interval_seconds 1",
+		"logstat_uptime_seconds",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the response does not contain %q\nbody:\n%s", want, body)
+		}
+	}
+	// The root is the status page for a browser, built from the same numbers.
+	code, page := httpGet(t, "http://"+addr+"/")
+	if code != 200 {
+		t.Fatalf("GET / = %d, want 200", code)
+	}
+	for _, want := range []string{"logstat", "get-number", h.cfg.LogPath, "/metrics"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the status page does not contain %q\nbody:\n%s", want, page)
+		}
+	}
+	if code, _ := httpGet(t, "http://"+addr+"/nope"); code != 404 {
+		t.Errorf("GET /nope = %d, want 404", code)
+	}
+
+	// The exporter goes down with the daemon and gives the port back.
+	stop()
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("the metrics port is still taken after the shutdown: %v", err)
+	}
+	_ = ln.Close()
+}
+
+func TestRunWithoutMetricsListensNowhere(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: tails a real file over several seconds")
+	}
+	h := newHarness(t, func(c *config.Config) { c.Poll = true })
+	runDaemon(t, h.d)
+	h.waitTailStarted(t)
+	waitTailAttached(t, h)
+
+	if got := h.d.MetricsAddr(); got != "" {
+		t.Fatalf("MetricsAddr = %q, want empty with metrics.enabled false", got)
+	}
+}
+
+// A taken port is fatal: running on without metrics that were explicitly
+// switched on would leave the monitoring side looking at silence.
+func TestRunFailsWhenTheMetricsPortIsTaken(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	h := newHarness(t, func(c *config.Config) {
+		c.Poll = true
+		c.Metrics.Enabled = true
+		c.Metrics.Listen = ln.Addr().String()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err = h.d.Run(ctx)
+	if err == nil {
+		t.Fatal("Run must fail when the metrics port is already in use")
+	}
+	if !strings.Contains(err.Error(), ln.Addr().String()) {
+		t.Errorf("error = %v, want it to name the address", err)
+	}
+	// The socket is opened before the log file is touched, so the failure is
+	// immediate instead of arriving after the first flush.
+	if out := h.log.String(); strings.Contains(out, "log file") {
+		t.Errorf("the daemon started tailing before failing on the metrics port:\n%s", out)
 	}
 }
 

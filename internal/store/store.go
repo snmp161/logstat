@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -221,6 +222,41 @@ func (s *Store) Reset(ctx context.Context, action string, ts time.Time) error {
 		return fmt.Errorf("reset counter %q: %w", action, err)
 	}
 	return s.SetHeartbeat(ctx, action, 0, ts)
+}
+
+// Counters returns the value of the integer counter of every action in one
+// round trip. An action whose key does not exist (never created, or expired) is
+// absent from the result rather than reported as a zero: the metrics exporter
+// must not invent a value that cannot be told from a counter really at zero.
+func (s *Store) Counters(ctx context.Context, actions []string) (map[string]int64, error) {
+	if len(actions) == 0 {
+		return map[string]int64{}, nil
+	}
+	keys := make([]string, len(actions))
+	for i, a := range actions {
+		keys[i] = CounterKey(s.host, a)
+	}
+	values, err := s.rdb.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, fmt.Errorf("read counters: %w", err)
+	}
+
+	out := make(map[string]int64, len(actions))
+	for i, v := range values {
+		if v == nil {
+			continue
+		}
+		raw, ok := v.(string)
+		if !ok {
+			return nil, fmt.Errorf("read counter %q: unexpected value type %T", actions[i], v)
+		}
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("read counter %q: %w", actions[i], err)
+		}
+		out[actions[i]] = n
+	}
+	return out, nil
 }
 
 // Get returns the current value of the integer counter for action.

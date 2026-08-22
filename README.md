@@ -17,6 +17,8 @@ Implemented in Go as a static binary (`CGO_ENABLED=0`), configured through YAML.
 - [Building](#building)
 - [Installing the package](#installing-the-package)
 - [Multiple configs and instances](#multiple-configs-and-instances)
+- [Prometheus metrics](#prometheus-metrics)
+  - [The status page](#the-status-page)
 - [The daemon's own log](#the-daemons-own-log)
 - [Read permissions on the log](#read-permissions-on-the-log)
 - [Operator warnings](#operator-warnings)
@@ -33,6 +35,7 @@ Implemented in Go as a static binary (`CGO_ENABLED=0`), configured through YAML.
 5. On the `reset.schedule` cron schedule the counters are zeroed: the rest of the buffer is flushed first (so the lines of the finishing interval are accounted for in it), then `SET counter 0` plus a heartbeat value of `lines=0`.
 6. Redis may be unreachable, including a remote one — the buffer keeps growing in memory, the daemon neither dies nor loses counts, and it catches up once Redis is back. An outage is logged once (repetitions at `debug` level), and so is the recovery. Once the connection is known to be down, the flush stops walking the remaining words instead of waiting for a connection timeout on each: neither a flush nor a shutdown grows with the number of words. Internal `go-redis` messages also go into the daemon log (at `debug`) rather than to stderr.
 7. On `SIGTERM`/`SIGINT` the rest of the buffer is flushed and the process exits with code 0.
+8. With `metrics.enabled: true` the daemon also serves its own [Prometheus metrics](#prometheus-metrics) over HTTP: uptime, the configuration it runs with, the per-word counters of this process and the per-word totals read from Redis. The root of the same port shows the same numbers as a [status page](#the-status-page) for a browser.
 
 The file offset is **deliberately not persisted** across restarts: the counter lives in Redis, so a restart does not lose what was accumulated, but lines written while the daemon was down are not counted retroactively.
 
@@ -120,6 +123,11 @@ logging:
 reset:
   enabled: true
   schedule: "0 0 * * *"
+
+metrics:
+  enabled: false
+  listen: 127.0.0.1:9843
+  path: /metrics
 ```
 
 | Parameter | Type | Default | Purpose |
@@ -141,6 +149,9 @@ reset:
 | `logging.file` | string | `""` | log file path when `output: file` (unique per config) |
 | `reset.enabled` | bool | `true` | enable the self-reset |
 | `reset.schedule` | string | `"0 0 * * *"` | cron schedule of the reset (standard 5-field) |
+| `metrics.enabled` | bool | `false` | serve the Prometheus metrics endpoint |
+| `metrics.listen` | string | `127.0.0.1:9843` | `host:port` of the exporter (unique per config) |
+| `metrics.path` | string | `/metrics` | path of the metrics endpoint |
 
 ### Case sensitivity
 
@@ -187,7 +198,7 @@ Descriptors such as `@daily` and `@hourly` are accepted too. The six-field synta
 
 With `reset.enabled: false` the daemon only counts; the zeroing is done by something else (an external script or timer, or a manual `logstat clear`).
 
-**Validation at startup.** The config is parsed strictly: an unknown field is an error. The daemon checks that `actions` is not empty, that `flush_interval > 0`, that `lock_file` is set and its directory can be created, that `reset.schedule` is a valid 5-field cron expression, that `logging.level` and `logging.output` are from the allowed sets, and that with `output: file` the `logging.file` field is non-empty and the path writable. The values of `poll`, `heartbeat_key` and `case_sensitive` must be booleans and `redis.ttl` must not be negative. A fatal config error exits with a non-zero code, which systemd shows in the unit status. Duplicates in `actions`, words that are a substring of another one and — with `case_sensitive: no` — words differing only in case produce a warning in the log but do not prevent the start.
+**Validation at startup.** The config is parsed strictly: an unknown field is an error. The daemon checks that `actions` is not empty, that `flush_interval > 0`, that `lock_file` is set and its directory can be created, that `reset.schedule` is a valid 5-field cron expression, that `logging.level` and `logging.output` are from the allowed sets, and that with `output: file` the `logging.file` field is non-empty and the path writable. `metrics.listen` has to parse as `host:port` with a port in 1..65535 and `metrics.path` has to start with a slash — both are checked whether or not the exporter is enabled, so that a typo does not wait for the day someone turns it on. The values of `poll`, `heartbeat_key`, `case_sensitive` and `metrics.enabled` must be booleans and `redis.ttl` must not be negative. A fatal config error exits with a non-zero code, which systemd shows in the unit status. Duplicates in `actions`, words that are a substring of another one and — with `case_sensitive: no` — words differing only in case produce a warning in the log but do not prevent the start.
 
 ## CLI
 
@@ -259,9 +270,122 @@ With several instances on one host:
 
 - every config needs its **own** `lock_file`, otherwise the second instance will not start because of `flock`. The unit gives each instance its own runtime directory (`RuntimeDirectory=logstat/%i` → `/run/logstat/<instance>`), which makes `/run/logstat/<instance>/logstat.lock` the natural path. It is also the only directory the daemon can write to under `ProtectSystem=strict`;
 - with `logging.output: file`, every instance needs its **own** `logging.file`;
+- with `metrics.enabled: true`, every instance needs its **own** `metrics.listen` port: a port already taken makes the instance fail to start;
 - if the instances point at the **same** Redis (host/port/db), their `actions` sets must not overlap, otherwise the keys collide (see [Operator warnings](#operator-warnings)). A different Redis or a different `db` settles the question by itself.
 
 Rollout goes either through Salt (`file.managed` for the package and the per-instance configs plus `service.running` over the list of instances) or by installing the `.deb` / `.rpm` from a GitHub Release.
+
+## Prometheus metrics
+
+The daemon can serve its own metrics over HTTP. The exporter is **off by default**: an upgrade must not open a listening socket where nobody expected one, and two instances on one host would otherwise fight over the same port.
+
+```yaml
+metrics:
+  enabled: true
+  listen: 127.0.0.1:9843   # loopback only; expose it deliberately
+  path: /metrics
+```
+
+```console
+$ curl -s localhost:9843/metrics | grep -v '^#' | grep logstat_
+logstat_config_actions 4
+logstat_config_case_sensitive 1
+logstat_config_flush_interval_seconds 10
+logstat_config_heartbeat_key 1
+logstat_config_info{host="app1",log_path="/var/log/app.log",...} 1
+logstat_config_poll 0
+logstat_config_redis_ttl_seconds 86400
+logstat_config_reset_enabled 1
+logstat_lines_read_total 12043
+logstat_matched_lines_total{action="get-number"} 417
+logstat_pending_increments{action="get-number"} 3
+logstat_redis_counter{action="get-number"} 8125
+logstat_redis_up 1
+logstat_start_time_seconds 1.7716...e+09
+logstat_uptime_seconds 3600
+```
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `logstat_uptime_seconds` | gauge | — | how long this process has been running |
+| `logstat_start_time_seconds` | gauge | — | unix timestamp of the start |
+| `logstat_config_info` | gauge | `log_path`, `lock_file`, `host`, `redis_addr`, `redis_db`, `redis_password_set`, `logging_level`, `logging_output`, `logging_file`, `reset_schedule`, `metrics_listen`, `metrics_path` | always `1`; the configuration this instance runs with |
+| `logstat_config_flush_interval_seconds` | gauge | — | `flush_interval` |
+| `logstat_config_redis_ttl_seconds` | gauge | — | `redis.ttl`, `0` meaning no expiry |
+| `logstat_config_case_sensitive` | gauge | — | `case_sensitive` as `1`/`0` |
+| `logstat_config_poll` | gauge | — | `poll` as `1`/`0` |
+| `logstat_config_heartbeat_key` | gauge | — | `heartbeat_key` as `1`/`0` |
+| `logstat_config_reset_enabled` | gauge | — | `reset.enabled` as `1`/`0` |
+| `logstat_config_actions` | gauge | — | number of configured code words |
+| `logstat_lines_read_total` | counter | — | log lines read since the start |
+| `logstat_matched_lines_total` | counter | `action` | matches of the word since the start (the in-memory counter) |
+| `logstat_pending_increments` | gauge | `action` | buffered, not yet flushed to Redis |
+| `logstat_redis_counter` | gauge | `action` | value of `logstat:counter:<host>:<action>`, read during the scrape |
+| `logstat_redis_up` | gauge | — | `1` if this scrape could read Redis |
+| `logstat_redis_scrape_errors_total` | counter | — | scrapes that failed to read Redis |
+
+The standard `go_*` and `process_*` collectors of `client_golang` are exported as well.
+
+### The status page
+
+The root of the same port answers with a summary for a human — what a browser is good for, as opposed to the raw exposition text:
+
+```
+logstat v0.3.0 · app1                                            /metrics →
+──────────────────────────────────────────────────────────────────────────
+up 1h 02m (since 2026-08-22 15:04:05 MSK) · redis 127.0.0.1:6379 db 0 · up
+
+code words
+  word                              in memory   buffered   in redis
+  get-number                              417          3       8125
+  get-sms                                  12          0        903
+  getNumber                                 0          0          0
+  getStatus                                41          1          —
+
+configuration
+  log_path          /var/log/app.log
+  lock_file         /run/logstat/app1/logstat.lock
+  case_sensitive    yes
+  flush_interval    10s
+  poll              no
+  heartbeat_key     yes
+  redis.ttl         24h0m0s
+  redis.password    not set
+  reset             0 0 * * *
+  logging           info → journald
+  metrics.listen    127.0.0.1:9843
+
+rendered 2026-08-22 16:06:07 MSK · reload to refresh
+```
+
+It is a summary on one screen, not a dashboard: no graphs, no history, no auto-refresh (reload the page instead — an abandoned browser tab must not keep hammering Redis), and nothing that can change the state of the daemon. Graphs and alerts are what Prometheus and Grafana are for.
+
+The three columns per word are the three numbers that can disagree, side by side: `in memory` is what this process has matched since it started, `buffered` is what is still waiting for the next flush, `in redis` is the shared total the external reader sees. A missing key shows as `—` rather than `0`, the same way it is a missing series in the metrics. With Redis unreachable the page still renders and says so in the header.
+
+Like the metrics, the page never shows the Redis password — only whether one is configured.
+
+With `metrics.path: /` the exposition takes the root and there is no status page.
+
+**The Redis password never appears in the metrics.** The `redis_password_set` label only says `true`/`false` — whether a `requirepass` password is configured at all.
+
+**Two counters per word, deliberately measuring different things.** `logstat_matched_lines_total` is this process's own counter: monotonic since the start, reset by a restart, independent of both Redis and `reset.schedule` — that is the one to use with `rate()`. `logstat_redis_counter` is what the external reader sees: shared per host and word, surviving a restart of the daemon and zeroed by `reset.schedule` — a sawtooth, useless for `rate()`. A drift between the two is a signal in itself: Redis unreachable, a key expired by TTL, or someone zeroing the counter from outside.
+
+Every configured word appears in `logstat_matched_lines_total` and `logstat_pending_increments` from the start, at zero, so "configured but never seen" does not look like "not configured".
+
+The values behind `logstat_redis_counter` are read during the scrape, in one `MGET` with a 2 s timeout (comfortably below the usual `scrape_timeout`). A scrape neither blocks nor takes the daemon down: with Redis unreachable the endpoint still answers, but `logstat_redis_up` is `0`, the `logstat_redis_counter` series are absent and `logstat_redis_scrape_errors_total` grows. A missing key means a missing series rather than a `0` — an invented zero is indistinguishable from a counter that was honestly zeroed.
+
+**A failed bind is fatal.** With `metrics.enabled: true` and the port already taken the daemon exits with a non-zero code and systemd shows the reason in the unit status. Running on silently without metrics that were explicitly switched on is worse: the monitoring side would see silence and conclude everything is fine. The socket is opened **before** the log file is tailed, so the failure happens immediately rather than after the first flush.
+
+A scrape config for a host running several instances:
+
+```yaml
+scrape_configs:
+  - job_name: logstat
+    static_configs:
+      - targets: ["app1.example.com:9843", "app1.example.com:9844"]
+```
+
+The endpoint has no TLS, no authentication and no rate limiting — that is out of scope by design. The default `listen` is loopback only; publishing it is the operator's deliberate act, ideally behind a firewall or a reverse proxy.
 
 ## The daemon's own log
 
@@ -330,7 +454,7 @@ make test     # go test -race ./...
 make cover    # plus a coverage profile and the resulting number
 ```
 
-No external services are needed: Redis is replaced by [miniredis](https://github.com/alicebob/miniredis) and log files are created in temporary directories. The suite covers matching (substring, both case modes, per-line counting, prefix overlaps), the config parser and validator (including the `case_sensitive` default, its warnings and an end-to-end run in the case-insensitive mode), key and value formatting, assembling `lines=<N>` from the `INCRBY` reply, the `heartbeat_key: false` mode, setting and renewing the TTL on both keys (including an abandoned key expiring and the expiry being cleared with `ttl: 0`), computing the next firing time of cron schedules, tailing across both rotation schemes, starting with the log file absent, behaviour with Redis unavailable and catching up after recovery, resetting the counters (both directly and through the scheduler on an every-second schedule, without waiting for real cron), log level filtering and log file reopening, single-instance enforcement through `flock`, and a graceful shutdown on a real `SIGTERM` in a separate process.
+No external services are needed: Redis is replaced by [miniredis](https://github.com/alicebob/miniredis) and log files are created in temporary directories. The suite covers matching (substring, both case modes, per-line counting, prefix overlaps), the config parser and validator (including the `case_sensitive` default, its warnings and an end-to-end run in the case-insensitive mode), key and value formatting, assembling `lines=<N>` from the `INCRBY` reply, the `heartbeat_key: false` mode, setting and renewing the TTL on both keys (including an abandoned key expiring and the expiry being cleared with `ttl: 0`), computing the next firing time of cron schedules, tailing across both rotation schemes, starting with the log file absent, behaviour with Redis unavailable and catching up after recovery, resetting the counters (both directly and through the scheduler on an every-second schedule, without waiting for real cron), log level filtering and log file reopening, single-instance enforcement through `flock`, and a graceful shutdown on a real `SIGTERM` in a separate process. The exporter is covered from both ends: the collector against a fake clock (uptime, every config value, the per-word series starting at zero, the totals surviving a drain of the buffer, the password never being rendered) and the endpoint over real HTTP (`200` on the configured path, the status page on the root and `404` elsewhere, values that follow miniredis, `logstat_redis_up 0` with Redis down, no socket at all when disabled, and a taken port failing the start).
 
 ## License
 
