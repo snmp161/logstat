@@ -31,6 +31,13 @@ type Server struct {
 // that were explicitly switched on would leave the monitoring side watching
 // silence and calling it health.
 func NewServer(cfg config.Metrics, c *Collector, lg *slog.Logger) (*Server, error) {
+	// Checked again here, not only in the config validator: the path goes into
+	// an http.ServeMux, which panics on a pattern it cannot parse. A bad path
+	// has to come back as an error from this call, whoever the caller is.
+	if err := cfg.ValidatePath(); err != nil {
+		return nil, fmt.Errorf("metrics: %w", err)
+	}
+
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return nil, fmt.Errorf("metrics: listen %s: %w", cfg.Listen, err)

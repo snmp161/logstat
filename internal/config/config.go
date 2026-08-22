@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/robfig/cron/v3"
 	"gopkg.in/yaml.v3"
@@ -259,8 +260,24 @@ func (m Metrics) validate() error {
 		return fmt.Errorf("metrics.listen port must be in 1..65535, got %d", n)
 	}
 
+	return m.ValidatePath()
+}
+
+// ValidatePath checks that the endpoint path is a plain path. It is exported
+// because the exporter repeats the check on its own input: the path ends up in
+// an http.ServeMux, which reads "{...}" as a wildcard and *panics* on a broken
+// one, so an unchecked path would turn a config typo into a crash loop instead
+// of a startup error.
+func (m Metrics) ValidatePath() error {
 	if !strings.HasPrefix(m.Path, "/") {
 		return fmt.Errorf("metrics.path must start with a slash, got %q", m.Path)
+	}
+	if strings.ContainsAny(m.Path, "{}") {
+		return fmt.Errorf("metrics.path must not contain { or }, got %q: "+
+			"the path is taken literally, not as a routing pattern", m.Path)
+	}
+	if strings.ContainsFunc(m.Path, unicode.IsSpace) {
+		return fmt.Errorf("metrics.path must not contain whitespace, got %q", m.Path)
 	}
 	return nil
 }

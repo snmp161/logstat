@@ -198,7 +198,7 @@ Descriptors such as `@daily` and `@hourly` are accepted too. The six-field synta
 
 With `reset.enabled: false` the daemon only counts; the zeroing is done by something else (an external script or timer, or a manual `logstat clear`).
 
-**Validation at startup.** The config is parsed strictly: an unknown field is an error. The daemon checks that `actions` is not empty, that `flush_interval > 0`, that `lock_file` is set and its directory can be created, that `reset.schedule` is a valid 5-field cron expression, that `logging.level` and `logging.output` are from the allowed sets, and that with `output: file` the `logging.file` field is non-empty and the path writable. `metrics.listen` has to parse as `host:port` with a port in 1..65535 and `metrics.path` has to start with a slash — both are checked whether or not the exporter is enabled, so that a typo does not wait for the day someone turns it on. The values of `poll`, `heartbeat_key`, `case_sensitive` and `metrics.enabled` must be booleans and `redis.ttl` must not be negative. A fatal config error exits with a non-zero code, which systemd shows in the unit status. Duplicates in `actions`, words that are a substring of another one and — with `case_sensitive: no` — words differing only in case produce a warning in the log but do not prevent the start.
+**Validation at startup.** The config is parsed strictly: an unknown field is an error. The daemon checks that `actions` is not empty, that `flush_interval > 0`, that `lock_file` is set and its directory can be created, that `reset.schedule` is a valid 5-field cron expression, that `logging.level` and `logging.output` are from the allowed sets, and that with `output: file` the `logging.file` field is non-empty and the path writable. `metrics.listen` has to parse as `host:port` with a port in 1..65535, and `metrics.path` has to start with a slash and carry neither braces nor whitespace — all of it checked whether or not the exporter is enabled, so that a typo does not wait for the day someone turns it on. The values of `poll`, `heartbeat_key`, `case_sensitive` and `metrics.enabled` must be booleans and `redis.ttl` must not be negative. A fatal config error exits with a non-zero code, which systemd shows in the unit status. Duplicates in `actions`, words that are a substring of another one and — with `case_sensitive: no` — words differing only in case produce a warning in the log but do not prevent the start.
 
 ## CLI
 
@@ -365,6 +365,8 @@ The three columns per word are the three numbers that can disagree, side by side
 Like the metrics, the page never shows the Redis password — only whether one is configured.
 
 With `metrics.path: /` the exposition takes the root and there is no status page.
+
+The path is taken literally. Braces and whitespace are rejected by the validation, because the `net/http` router reads `{...}` as a wildcard — `/{env}` would serve the metrics on any one-segment path — and panics outright on a broken pattern such as `/met{rics`. The exporter repeats the check on its own input, so no caller can bring the process down with a panic instead of a config error.
 
 **The Redis password never appears in the metrics.** The `redis_password_set` label only says `true`/`false` — whether a `requirepass` password is configured at all.
 

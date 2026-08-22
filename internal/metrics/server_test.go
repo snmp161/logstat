@@ -171,6 +171,55 @@ func TestNewServerFailsOnATakenPort(t *testing.T) {
 	}
 }
 
+// A path that net/http would read as a routing pattern must come back as an
+// error. The config validator rejects it too, but NewServer is reachable
+// without that validation, and http.ServeMux answers a broken pattern with a
+// panic — a config typo must not take the process down that way.
+func TestNewServerRejectsAPathThatIsARoutingPattern(t *testing.T) {
+	for _, path := range []string{"/met{rics", "/{env}", "/metrics extra", "/metrics}"} {
+		t.Run(path, func(t *testing.T) {
+			cfg := testConfig()
+			mcfg := config.Metrics{Enabled: true, Listen: "127.0.0.1:0", Path: path}
+
+			srv, err := NewServer(mcfg, newTestCollector(t, cfg, counter.New(cfg.Actions, true), &stubReader{}), discardLogger())
+			if err == nil {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				_ = srv.Shutdown(ctx)
+				t.Fatalf("NewServer(%q) must fail", path)
+			}
+			if !strings.Contains(err.Error(), "metrics.path") {
+				t.Errorf("error = %v, want it to name metrics.path", err)
+			}
+		})
+	}
+}
+
+// The bad path is caught before the socket is opened, so a failed start leaves
+// nothing bound behind it.
+func TestNewServerValidatesBeforeBinding(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := testConfig()
+	mcfg := config.Metrics{Enabled: true, Listen: addr, Path: "/met{rics"}
+	if _, err := NewServer(mcfg, newTestCollector(t, cfg, counter.New(cfg.Actions, true), &stubReader{}), discardLogger()); err == nil {
+		t.Fatal("NewServer must fail on a bad path")
+	}
+
+	again, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("the port was left bound by the failed NewServer: %v", err)
+	}
+	_ = again.Close()
+}
+
 // Shutdown has to release the port: the daemon stops the exporter before it
 // exits, and a restart must not hit "address already in use".
 func TestServerShutdownReleasesThePort(t *testing.T) {

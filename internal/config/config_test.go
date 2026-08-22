@@ -196,6 +196,15 @@ func TestValidateFatal(t *testing.T) {
 		{"metrics port out of range", func(c *Config) { c.Metrics.Listen = "127.0.0.1:70000" }, "metrics.listen"},
 		{"empty metrics path", func(c *Config) { c.Metrics.Path = "" }, "metrics.path"},
 		{"metrics path without a slash", func(c *Config) { c.Metrics.Path = "metrics" }, "metrics.path"},
+		// net/http reads {...} as a wildcard and panics on a broken one, so a
+		// path that looks like a routing pattern is refused outright.
+		{"metrics path with a wildcard", func(c *Config) { c.Metrics.Path = "/{env}" }, "metrics.path"},
+		{"metrics path with a broken wildcard", func(c *Config) { c.Metrics.Path = "/met{rics" }, "metrics.path"},
+		{"metrics path with a closing brace", func(c *Config) { c.Metrics.Path = "/metrics}" }, "metrics.path"},
+		// A space would be read as the method/path separator of a pattern.
+		{"metrics path with a space", func(c *Config) { c.Metrics.Path = "/metrics extra" }, "metrics.path"},
+		{"metrics path with a tab", func(c *Config) { c.Metrics.Path = "/metrics\tx" }, "metrics.path"},
+		{"metrics path with a trailing space", func(c *Config) { c.Metrics.Path = "/metrics " }, "metrics.path"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -414,6 +423,19 @@ func TestMetricsListenAcceptedForms(t *testing.T) {
 		}
 		if len(warnings) != 0 {
 			t.Errorf("listen %q warnings = %v, want none", listen, warnings)
+		}
+	}
+}
+
+// The paths an operator actually writes have to stay legal.
+func TestMetricsPathAcceptedForms(t *testing.T) {
+	for _, path := range []string{"/metrics", "/", "/internal/metrics", "/metrics-v2", "/_/metrics"} {
+		cfg := Default()
+		cfg.Metrics.Enabled = true
+		cfg.Metrics.Path = path
+
+		if _, err := cfg.Validate(); err != nil {
+			t.Errorf("path %q must be valid: %v", path, err)
 		}
 	}
 }
