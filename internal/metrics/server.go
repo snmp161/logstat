@@ -14,9 +14,14 @@ import (
 	"github.com/snmp161/logstat/internal/config"
 )
 
-// readHeaderTimeout bounds how long a client may take to send its request
-// headers, so that an idle connection cannot pin a goroutine forever.
-const readHeaderTimeout = 5 * time.Second
+// Timeouts of the endpoint. A scrape is a small GET, so the only reason to be
+// generous is the Redis read it triggers: writeTimeout has to stay comfortably
+// above defaultTimeout, or a slow Redis would cut the response in half.
+const (
+	readHeaderTimeout = 5 * time.Second
+	writeTimeout      = 30 * time.Second
+	idleTimeout       = 60 * time.Second
+)
 
 // Server is the HTTP endpoint serving the metrics of one daemon.
 type Server struct {
@@ -65,6 +70,8 @@ func NewServer(cfg config.Metrics, c *Collector, lg *slog.Logger) (*Server, erro
 		srv: &http.Server{
 			Handler:           mux,
 			ReadHeaderTimeout: readHeaderTimeout,
+			WriteTimeout:      writeTimeout,
+			IdleTimeout:       idleTimeout,
 		},
 	}, nil
 }

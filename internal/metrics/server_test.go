@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -218,6 +219,108 @@ func TestNewServerValidatesBeforeBinding(t *testing.T) {
 		t.Fatalf("the port was left bound by the failed NewServer: %v", err)
 	}
 	_ = again.Close()
+}
+
+// A scrape must not be able to pin a connection open, and the write timeout has
+// to leave room for the Redis read the scrape does.
+func TestServerHasTimeouts(t *testing.T) {
+	cfg := testConfig()
+	mcfg := config.Metrics{Enabled: true, Listen: "127.0.0.1:0", Path: "/metrics"}
+	srv := startServer(t, mcfg, cfg, counter.New(cfg.Actions, true), &stubReader{})
+
+	if srv.srv.ReadHeaderTimeout <= 0 || srv.srv.WriteTimeout <= 0 || srv.srv.IdleTimeout <= 0 {
+		t.Fatalf("timeouts = %v / %v / %v, all three must be set",
+			srv.srv.ReadHeaderTimeout, srv.srv.WriteTimeout, srv.srv.IdleTimeout)
+	}
+	if srv.srv.WriteTimeout <= defaultTimeout {
+		t.Errorf("WriteTimeout %v must exceed the %v Redis read of a scrape, or a slow Redis truncates the response",
+			srv.srv.WriteTimeout, defaultTimeout)
+	}
+}
+
+// Serve reports an abrupt death of the socket, which is what makes the daemon
+// stop instead of counting on without metrics.
+func TestServeReportsALostListener(t *testing.T) {
+	cfg := testConfig()
+	mcfg := config.Metrics{Enabled: true, Listen: "127.0.0.1:0", Path: "/metrics"}
+	srv, err := NewServer(mcfg, newTestCollector(t, cfg, counter.New(cfg.Actions, true), &stubReader{}), discardLogger())
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve() }()
+
+	// Kill the socket under the running server, the way a fatal accept error
+	// would; a graceful Shutdown is covered separately and must stay silent.
+	if err := srv.ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-served:
+		if err == nil {
+			t.Fatal("Serve must report a listener that died under it")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after the listener was closed")
+	}
+}
+
+// Shutdown reports a deadline that passed while a scrape was still in flight,
+// instead of pretending the server stopped cleanly.
+func TestShutdownWithAScrapeStillRunning(t *testing.T) {
+	cfg := testConfig()
+	rd := &stubReader{entered: make(chan struct{}), release: make(chan struct{})}
+	mcfg := config.Metrics{Enabled: true, Listen: "127.0.0.1:0", Path: "/metrics"}
+
+	srv, err := NewServer(mcfg, newTestCollector(t, cfg, counter.New(cfg.Actions, true), rd), discardLogger())
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	go func() { _ = srv.Serve() }()
+
+	scraped := make(chan struct{})
+	go func() {
+		defer close(scraped)
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://"+srv.Addr()+"/metrics", nil)
+		if err != nil {
+			return
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+	}()
+
+	<-rd.entered // the handler is inside the Redis read and cannot finish yet
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err == nil {
+		t.Error("Shutdown must report the deadline it could not meet")
+	}
+
+	close(rd.release)
+	<-scraped
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	if err := srv.Shutdown(stopCtx); err != nil {
+		t.Errorf("second Shutdown: %v", err)
+	}
+}
+
+// promhttp reports its own trouble through the daemon log, not the standard
+// logger, which would bypass logging.output.
+func TestErrorLogGoesToTheDaemonLog(t *testing.T) {
+	var buf bytes.Buffer
+	lg := slog.New(slog.NewTextHandler(&buf, nil))
+
+	slogErrorLog{lg: lg}.Println("gathering failed: ", "boom")
+
+	if !strings.Contains(buf.String(), "boom") {
+		t.Fatalf("the message did not reach the logger: %q", buf.String())
+	}
 }
 
 // Shutdown has to release the port: the daemon stops the exporter before it

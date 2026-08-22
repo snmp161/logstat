@@ -158,22 +158,27 @@ func Load(path string) (cfg *Config, warnings []string, err error) {
 }
 
 // Validate checks the configuration without touching the filesystem.
-// It returns warnings for suspicious but legal setups and an error for fatal ones.
+// It returns warnings for suspicious but legal setups and an error for fatal
+// ones. Every check runs: a config with three typos reports all three at once
+// instead of turning the fix into a restart-per-typo loop.
 func (c *Config) Validate() ([]string, error) {
 	var warnings []string
+	var errs []error
+	fail := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
 
 	if strings.TrimSpace(c.LogPath) == "" {
-		return warnings, errors.New("log_path must not be empty")
+		fail("log_path must not be empty")
 	}
 
 	if len(c.Actions) == 0 {
-		return warnings, errors.New("actions must not be empty")
+		fail("actions must not be empty")
 	}
 	seen := make(map[string]bool, len(c.Actions))
 	uniq := make([]string, 0, len(c.Actions))
 	for i, a := range c.Actions {
 		if a == "" {
-			return warnings, fmt.Errorf("actions[%d] must not be empty", i)
+			fail("actions[%d] must not be empty", i)
+			continue
 		}
 		if seen[a] {
 			warnings = append(warnings, fmt.Sprintf("action %q is listed more than once, duplicates ignored", a))
@@ -186,59 +191,84 @@ func (c *Config) Validate() ([]string, error) {
 	warnings = append(warnings, Overlaps(c.Actions, c.CaseSensitive)...)
 
 	if c.FlushInterval <= 0 {
-		return warnings, fmt.Errorf("flush_interval must be > 0, got %d", c.FlushInterval)
+		fail("flush_interval must be > 0, got %d", c.FlushInterval)
 	}
 
 	if strings.TrimSpace(c.LockFile) == "" {
-		return warnings, errors.New("lock_file must not be empty")
+		fail("lock_file must not be empty")
 	}
 
 	if strings.TrimSpace(c.Redis.Host) == "" {
-		return warnings, errors.New("redis.host must not be empty")
+		fail("redis.host must not be empty")
 	}
 	if c.Redis.Port < 1 || c.Redis.Port > 65535 {
-		return warnings, fmt.Errorf("redis.port must be in 1..65535, got %d", c.Redis.Port)
+		fail("redis.port must be in 1..65535, got %d", c.Redis.Port)
 	}
 	if c.Redis.DB < 0 {
-		return warnings, fmt.Errorf("redis.db must be >= 0, got %d", c.Redis.DB)
+		fail("redis.db must be >= 0, got %d", c.Redis.DB)
 	}
 	if c.Redis.TTL < 0 {
-		return warnings, fmt.Errorf("redis.ttl must be >= 0 seconds, got %d", c.Redis.TTL)
+		fail("redis.ttl must be >= 0 seconds, got %d", c.Redis.TTL)
 	}
 	// A TTL shorter than the flush interval would let the keys expire between two
 	// flushes even though the daemon is alive and counting.
-	if c.Redis.TTL > 0 && c.Redis.TTL <= c.FlushInterval {
+	if c.Redis.TTL > 0 && c.FlushInterval > 0 && c.Redis.TTL <= c.FlushInterval {
 		warnings = append(warnings, fmt.Sprintf(
 			"redis.ttl (%ds) is not longer than flush_interval (%ds): keys may expire between two flushes and lose their total",
 			c.Redis.TTL, c.FlushInterval))
 	}
 
 	if !slices.Contains(Levels, c.Logging.Level) {
-		return warnings, fmt.Errorf("logging.level must be one of %s, got %q",
-			strings.Join(Levels, "/"), c.Logging.Level)
+		fail("logging.level must be one of %s, got %q", strings.Join(Levels, "/"), c.Logging.Level)
 	}
 	switch c.Logging.Output {
 	case OutputJournald:
 	case OutputFile:
 		if strings.TrimSpace(c.Logging.File) == "" {
-			return warnings, errors.New(`logging.file must not be empty when logging.output is "file"`)
+			fail(`logging.file must not be empty when logging.output is "file"`)
 		}
 	default:
-		return warnings, fmt.Errorf(`logging.output must be %q or %q, got %q`, OutputJournald, OutputFile, c.Logging.Output)
+		fail(`logging.output must be %q or %q, got %q`, OutputJournald, OutputFile, c.Logging.Output)
 	}
 
 	// The schedule is validated regardless of reset.enabled so that a typo is not
 	// discovered months later, when someone flips the flag on.
 	if _, err := ParseSchedule(c.Reset.Schedule); err != nil {
-		return warnings, err
+		errs = append(errs, err)
 	}
 	// Same reasoning for the exporter: checked whether or not it is enabled.
 	if err := c.Metrics.validate(); err != nil {
-		return warnings, err
+		errs = append(errs, err)
 	}
 
-	return warnings, nil
+	return warnings, join(errs)
 }
+
+// join collapses the collected problems into one error. It keeps them on a
+// single line, because this ends up as the value of a log attribute, and keeps
+// them unwrappable, so errors.Is still works on any of them.
+func join(errs []error) error {
+	switch len(errs) {
+	case 0:
+		return nil
+	case 1:
+		return errs[0]
+	default:
+		return multiError(errs)
+	}
+}
+
+type multiError []error
+
+func (m multiError) Error() string {
+	msgs := make([]string, 0, len(m))
+	for _, err := range m {
+		msgs = append(msgs, err.Error())
+	}
+	return strings.Join(msgs, "; ")
+}
+
+func (m multiError) Unwrap() []error { return m }
 
 // validate checks the exporter address and path without binding anything.
 func (m Metrics) validate() error {
@@ -278,6 +308,12 @@ func (m Metrics) ValidatePath() error {
 	}
 	if strings.ContainsFunc(m.Path, unicode.IsSpace) {
 		return fmt.Errorf("metrics.path must not contain whitespace, got %q", m.Path)
+	}
+	// To net/http a trailing slash means a subtree, so "/metrics/" would answer
+	// on "/metrics/anything" as well. The root is the one legal exception.
+	if m.Path != "/" && strings.HasSuffix(m.Path, "/") {
+		return fmt.Errorf("metrics.path must not end with a slash, got %q: "+
+			"that would serve the metrics on every path below it", m.Path)
 	}
 	return nil
 }

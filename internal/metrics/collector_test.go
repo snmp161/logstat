@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,17 +28,38 @@ var (
 )
 
 // stubReader stands in for the store when the test needs to control what the
-// Redis read returns, an outage in particular.
+// Redis read returns: an outage, or a read that hangs until the test lets go.
 type stubReader struct {
 	counters map[string]int64
 	err      error
-	calls    int
+
+	// entered is closed on the first call and release blocks that call until
+	// the test closes it, which keeps a scrape in flight.
+	entered chan struct{}
+	release chan struct{}
+
+	mu    sync.Mutex
+	calls int
 }
 
 func (s *stubReader) Host() string { return testHost }
 
-func (s *stubReader) Counters(_ context.Context, _ []string) (map[string]int64, error) {
+func (s *stubReader) Counters(ctx context.Context, _ []string) (map[string]int64, error) {
+	s.mu.Lock()
 	s.calls++
+	first := s.calls == 1
+	s.mu.Unlock()
+
+	if s.release != nil {
+		if first && s.entered != nil {
+			close(s.entered)
+		}
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -225,19 +247,16 @@ func TestCollectorConfigMetrics(t *testing.T) {
 	if got := value(t, families, "logstat_config_info"); got != 1 {
 		t.Errorf("logstat_config_info = %v, want 1", got)
 	}
+	// Only what a query would join or filter on. Everything else about the
+	// configuration is on the status page, where it costs no time series.
 	want := map[string]string{
 		"log_path":           "/var/log/app.log",
-		"lock_file":          "/run/logstat/default/logstat.lock",
 		"host":               testHost,
 		"redis_addr":         "10.0.0.5:6380",
 		"redis_db":           "3",
 		"redis_password_set": "true",
-		"logging_level":      "debug",
 		"logging_output":     "file",
-		"logging_file":       "/var/log/logstat/app.log",
 		"reset_schedule":     "*/30 * * * *",
-		"metrics_listen":     "127.0.0.1:9843",
-		"metrics_path":       "/metrics",
 	}
 	got := labels(t, families, "logstat_config_info")
 	for k, v := range want {
@@ -443,6 +462,40 @@ func TestCollectorSurvivesARedisOutage(t *testing.T) {
 	}
 	if got := value(t, families, "logstat_redis_scrape_errors_total"); got != 2 {
 		t.Errorf("logstat_redis_scrape_errors_total must not grow on a good scrape, got %v", got)
+	}
+}
+
+// Somebody else writing a non-integer into one of the keys is not an outage:
+// Redis answered. The broken word drops out, the rest is exported, and the
+// scrape error counter is what records that something is wrong.
+func TestCollectorMalformedValueIsNotAnOutage(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	st := store.NewWithClient(rdb, testHost, true, 0)
+
+	cfg := testConfig()
+	c := newTestCollector(t, cfg, counter.New(cfg.Actions, true), st)
+
+	if err := mr.Set(store.CounterKey(testHost, "get-number"), "8125"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mr.Set(store.CounterKey(testHost, "get-sms"), "written-by-someone-else"); err != nil {
+		t.Fatal(err)
+	}
+
+	families := gather(t, c)
+	if got := value(t, families, "logstat_redis_up"); got != 1 {
+		t.Errorf("logstat_redis_up = %v, want 1: Redis answered", got)
+	}
+	if got := labelled(t, families, "logstat_redis_counter", "action", "get-number"); got != 8125 {
+		t.Errorf("logstat_redis_counter{get-number} = %v, want 8125", got)
+	}
+	if has(families, "logstat_redis_counter", "action", "get-sms") {
+		t.Error("the word with the unreadable value must be skipped, not guessed at")
+	}
+	if got := value(t, families, "logstat_redis_scrape_errors_total"); got != 1 {
+		t.Errorf("logstat_redis_scrape_errors_total = %v, want 1", got)
 	}
 }
 

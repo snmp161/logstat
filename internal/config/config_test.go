@@ -205,6 +205,9 @@ func TestValidateFatal(t *testing.T) {
 		{"metrics path with a space", func(c *Config) { c.Metrics.Path = "/metrics extra" }, "metrics.path"},
 		{"metrics path with a tab", func(c *Config) { c.Metrics.Path = "/metrics\tx" }, "metrics.path"},
 		{"metrics path with a trailing space", func(c *Config) { c.Metrics.Path = "/metrics " }, "metrics.path"},
+		// A trailing slash is a subtree pattern: /metrics/anything would answer too.
+		{"metrics path with a trailing slash", func(c *Config) { c.Metrics.Path = "/metrics/" }, "metrics.path"},
+		{"nested metrics path with a trailing slash", func(c *Config) { c.Metrics.Path = "/internal/metrics/" }, "metrics.path"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -428,6 +431,56 @@ func TestMetricsListenAcceptedForms(t *testing.T) {
 }
 
 // The paths an operator actually writes have to stay legal.
+// Fixing a config should not be a fix-restart-repeat loop: one run of the
+// validator reports everything that is wrong with it.
+func TestValidateReportsEveryError(t *testing.T) {
+	cfg := Default()
+	cfg.FlushInterval = 0
+	cfg.LockFile = ""
+	cfg.Logging.Level = "trace"
+	cfg.Redis.Port = 0
+	cfg.Metrics.Path = "metrics"
+
+	_, err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	for _, want := range []string{"flush_interval", "lock_file", "logging.level", "redis.port", "metrics.path"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %s", err, want)
+		}
+	}
+	// One line, not a wall of text: this ends up in a log record.
+	if strings.Contains(err.Error(), "\n") {
+		t.Errorf("the joined error must stay on one line, got %q", err)
+	}
+	if n := strings.Count(err.Error(), "; "); n != 4 {
+		t.Errorf("expected 5 errors separated by \"; \", got %q", err)
+	}
+
+	// A single problem still reads like a single problem.
+	cfg = Default()
+	cfg.FlushInterval = 0
+	if _, err := cfg.Validate(); err == nil || strings.Contains(err.Error(), "; ") {
+		t.Fatalf("a lone error must not be decorated: %v", err)
+	}
+}
+
+// An empty actions list must not suppress the checks that follow it.
+func TestValidateContinuesAfterEmptyActions(t *testing.T) {
+	cfg := Default()
+	cfg.Actions = nil
+	cfg.Redis.TTL = -1
+
+	_, err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "actions") || !strings.Contains(err.Error(), "redis.ttl") {
+		t.Errorf("error = %q, want both the empty actions and the negative ttl", err)
+	}
+}
+
 func TestMetricsPathAcceptedForms(t *testing.T) {
 	for _, path := range []string{"/metrics", "/", "/internal/metrics", "/metrics-v2", "/_/metrics"} {
 		cfg := Default()

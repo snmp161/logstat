@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -860,6 +861,96 @@ func TestRunFailsWhenTheMetricsPortIsTaken(t *testing.T) {
 	// immediate instead of arriving after the first flush.
 	if out := h.log.String(); strings.Contains(out, "log file") {
 		t.Errorf("the daemon started tailing before failing on the metrics port:\n%s", out)
+	}
+}
+
+// An exporter that dies while the daemon runs is as fatal as a port that could
+// not be bound in the first place: counting on without the metrics somebody
+// switched on leaves the monitoring side reading silence as health.
+func TestRunStopsWhenTheExporterDies(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: tails a real file over several seconds")
+	}
+	h := newHarness(t, func(c *config.Config) {
+		c.Poll = true
+		c.Metrics.Enabled = true
+	})
+	h.cfg.Metrics.Listen = "127.0.0.1:0" // see TestRunServesMetrics
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- h.d.Run(ctx) }()
+
+	h.waitMetricsAddr(t)
+	waitTailAttached(t, h)
+	appendLines(t, h.cfg.LogPath, "one get-number")
+	// The line has to be counted before the exporter dies, or the assertion
+	// below would pass on an empty buffer and prove nothing.
+	h.waitFor(t, "the line to be counted", func() bool { return h.d.Counter().Matched()["get-number"] == 1 })
+
+	// What a fatal accept error would look like from the daemon's side.
+	h.d.metricsErr <- errors.New("listener died")
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("Run must return the error the exporter died with")
+		}
+		if !strings.Contains(err.Error(), "listener died") {
+			t.Errorf("Run returned %v, want the exporter error", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatalf("Run did not return\ndaemon log:\n%s", h.log.String())
+	}
+
+	// The buffer still reaches Redis: a fatal exporter is not a reason to drop
+	// what was already counted.
+	h.waitFor(t, "the final flush", func() bool { return h.counter(t, "get-number") == "1" })
+}
+
+// The normal path must stay quiet: a graceful shutdown of the exporter is not
+// an error and must not be mistaken for one.
+func TestRunIgnoresACleanExporterStop(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: tails a real file over several seconds")
+	}
+	h := newHarness(t, func(c *config.Config) {
+		c.Poll = true
+		c.Metrics.Enabled = true
+	})
+	h.cfg.Metrics.Listen = "127.0.0.1:0"
+
+	stop := runDaemon(t, h.d)
+	h.waitMetricsAddr(t)
+	waitTailAttached(t, h)
+
+	stop() // runDaemon fails the test if Run returns an error here
+
+	if len(h.d.metricsErr) != 0 {
+		t.Error("a clean shutdown must not queue an exporter error")
+	}
+}
+
+// After an outage the daemon says so once, and it has to say so even if nothing
+// was counted meanwhile: the TTL refresh of an idle flush is a Redis round trip
+// like any other, and it is what notices the recovery.
+func TestIdleFlushNoticesRedisComingBack(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.Redis.TTL = 3600 })
+	ctx := context.Background()
+
+	h.d.Flush(ctx) // bootstraps the keys while Redis is healthy
+
+	h.mr.SetError("LOADING Redis is loading the dataset in memory")
+	h.d.Flush(ctx) // nothing buffered: only the TTL refresh talks to Redis
+	if !strings.Contains(h.log.String(), "redis unavailable") {
+		t.Fatalf("the outage must be logged once:\n%s", h.log.String())
+	}
+
+	h.mr.SetError("")
+	h.d.Flush(ctx)
+	if !strings.Contains(h.log.String(), "redis is back") {
+		t.Fatalf("an idle flush must notice the recovery:\n%s", h.log.String())
 	}
 }
 

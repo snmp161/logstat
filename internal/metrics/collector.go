@@ -15,6 +15,7 @@ import (
 
 	"github.com/snmp161/logstat/internal/config"
 	"github.com/snmp161/logstat/internal/counter"
+	"github.com/snmp161/logstat/internal/store"
 )
 
 // namespace prefixes every metric of this exporter.
@@ -84,14 +85,17 @@ type Collector struct {
 	redisScrapeErrs *prometheus.Desc
 }
 
-// configInfoLabels are the labels of logstat_config_info, in a fixed order. The
-// Redis password is not among them and never will be: the label only tells
+// configInfoLabels are the labels of logstat_config_info, in a fixed order:
+// what a query would join or filter on, and nothing else. Every label here is a
+// new time series whenever it changes, and the rest of the configuration is one
+// click away on the status page, where it costs nothing.
+//
+// The Redis password is not among them and never will be: the label only tells
 // whether one is configured.
 var configInfoLabels = []string{
-	"log_path", "lock_file", "host",
+	"log_path", "host",
 	"redis_addr", "redis_db", "redis_password_set",
-	"logging_level", "logging_output", "logging_file",
-	"reset_schedule", "metrics_listen", "metrics_path",
+	"logging_output", "reset_schedule",
 }
 
 // NewCollector builds the collector for one daemon.
@@ -173,17 +177,12 @@ func (c *Collector) collectConfig(ch chan<- prometheus.Metric) {
 	cfg := c.cfg
 	ch <- prometheus.MustNewConstMetric(c.configInfo, prometheus.GaugeValue, 1,
 		cfg.LogPath,
-		cfg.LockFile,
 		c.reader.Host(),
 		cfg.Redis.Addr(),
 		strconv.Itoa(cfg.Redis.DB),
 		boolLabel(cfg.Redis.Password != ""),
-		cfg.Logging.Level,
 		cfg.Logging.Output,
-		cfg.Logging.File,
 		cfg.Reset.Schedule,
-		cfg.Metrics.Listen,
-		cfg.Metrics.Path,
 	)
 	ch <- prometheus.MustNewConstMetric(c.flushInterval, prometheus.GaugeValue, float64(cfg.FlushInterval))
 	ch <- prometheus.MustNewConstMetric(c.redisTTL, prometheus.GaugeValue, float64(cfg.Redis.TTL))
@@ -214,14 +213,17 @@ func (c *Collector) collectRedis(ch chan<- prometheus.Metric) {
 	counters, err := c.reader.Counters(ctx, c.cfg.Actions)
 	if err != nil {
 		c.redisErrors.Add(1)
-		ch <- prometheus.MustNewConstMetric(c.redisUp, prometheus.GaugeValue, 0)
-	} else {
-		ch <- prometheus.MustNewConstMetric(c.redisUp, prometheus.GaugeValue, 1)
-		// A key that does not exist is missing from the map and stays missing
-		// here: an invented zero is indistinguishable from a real one.
-		for action, n := range counters {
-			ch <- prometheus.MustNewConstMetric(c.redisCounter, prometheus.GaugeValue, float64(n), action)
-		}
+		c.log.Warn("metrics scrape could not read redis", "error", err)
+	}
+	// redis_up answers one question: did Redis reply? A key holding something
+	// unreadable is not a connectivity problem — that word is simply skipped,
+	// like a key that does not exist, and the others are exported as usual.
+	// Otherwise one foreign key would black out the whole picture.
+	ch <- prometheus.MustNewConstMetric(c.redisUp, prometheus.GaugeValue, boolValue(!store.IsUnavailable(err)))
+	// A key that does not exist is missing from the map and stays missing here:
+	// an invented zero is indistinguishable from a real one.
+	for action, n := range counters {
+		ch <- prometheus.MustNewConstMetric(c.redisCounter, prometheus.GaugeValue, float64(n), action)
 	}
 	ch <- prometheus.MustNewConstMetric(c.redisScrapeErrs, prometheus.CounterValue, float64(c.redisErrors.Load()))
 }
@@ -236,18 +238,4 @@ func NewRegistry(c *Collector) *prometheus.Registry {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
 	return reg
-}
-
-func boolValue(b bool) float64 {
-	if b {
-		return 1
-	}
-	return 0
-}
-
-func boolLabel(b bool) string {
-	if b {
-		return "true"
-	}
-	return "false"
 }

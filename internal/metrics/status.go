@@ -6,7 +6,8 @@ import (
 	"html/template"
 	"net/http"
 	"strconv"
-	"time"
+
+	"github.com/snmp161/logstat/internal/store"
 )
 
 // missing is what a word whose Redis key does not exist shows instead of a
@@ -26,6 +27,9 @@ type statusData struct {
 	RedisAddr string
 	RedisDB   int
 	RedisUp   bool
+	// RedisNote explains a read that reached Redis but came back partly
+	// unusable; empty when there is nothing to say.
+	RedisNote string
 
 	Words  []wordRow
 	Config [][2]string
@@ -46,7 +50,14 @@ func (c *Collector) status() statusData {
 	defer cancel()
 
 	counters, err := c.reader.Counters(ctx, c.cfg.Actions)
-	redisUp := err == nil
+	// The header answers the same question as logstat_redis_up: did Redis
+	// answer? A key somebody else wrote into is not an outage, so it is called
+	// out beside the status instead of being reported as one.
+	redisUp := !store.IsUnavailable(err)
+	var redisNote string
+	if err != nil && redisUp {
+		redisNote = err.Error() + " (shown as unreadable)"
+	}
 
 	matched := c.cnt.Matched()
 	pending := c.cnt.PendingByAction()
@@ -74,6 +85,7 @@ func (c *Collector) status() statusData {
 		RedisAddr:   cfg.Redis.Addr(),
 		RedisDB:     cfg.Redis.DB,
 		RedisUp:     redisUp,
+		RedisNote:   redisNote,
 		Words:       words,
 		Config: [][2]string{
 			{"log_path", cfg.LogPath},
@@ -103,63 +115,6 @@ func (c *Collector) statusHandler() http.Handler {
 			c.log.Warn("cannot render the status page", "error", err)
 		}
 	})
-}
-
-// formatUptime renders a duration the way a person reads it: the two units that
-// matter and no more.
-func formatUptime(d time.Duration) string {
-	if d < 0 {
-		d = 0
-	}
-	switch {
-	case d < time.Minute:
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%dm %02ds", int(d.Minutes()), int(d.Seconds())%60)
-	case d < 24*time.Hour:
-		return fmt.Sprintf("%dh %02dm", int(d.Hours()), int(d.Minutes())%60)
-	default:
-		return fmt.Sprintf("%dd %02dh", int(d.Hours())/24, int(d.Hours())%24)
-	}
-}
-
-// humanTime is the timestamp format of the page: readable at a glance and free
-// of characters the HTML escaper would rewrite.
-const humanTime = "2006-01-02 15:04:05 MST"
-
-func setOrNot(b bool) string {
-	if b {
-		return "set"
-	}
-	return "not set"
-}
-
-func yesNo(b bool) string {
-	if b {
-		return "yes"
-	}
-	return "no"
-}
-
-func formatTTL(seconds int) string {
-	if seconds == 0 {
-		return "no expiry"
-	}
-	return (time.Duration(seconds) * time.Second).String()
-}
-
-func formatReset(enabled bool, schedule string) string {
-	if !enabled {
-		return "disabled (zeroed externally)"
-	}
-	return schedule
-}
-
-func formatLogging(level, output, file string) string {
-	if file != "" {
-		return fmt.Sprintf("%s → %s (%s)", level, output, file)
-	}
-	return fmt.Sprintf("%s → %s", level, output)
 }
 
 // statusTemplate is deliberately one self-contained page: no assets to serve,
@@ -202,7 +157,8 @@ footer { margin-top: 2rem; }
 
 <p>up {{.Uptime}} <span class="dim">(since {{.Started}})</span> ·
 redis {{.RedisAddr}} db {{.RedisDB}} ·
-{{if .RedisUp}}<span class="ok">up</span>{{else}}<span class="bad">unreachable</span>{{end}}</p>
+{{if .RedisUp}}<span class="ok">up</span>{{else}}<span class="bad">unreachable</span>{{end}}
+{{with .RedisNote}}<br><span class="bad">{{.}}</span>{{end}}</p>
 
 <h2>code words</h2>
 <table>

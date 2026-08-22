@@ -74,6 +74,11 @@ func IsUnavailable(err error) bool {
 	if err == nil {
 		return false
 	}
+	// A value we could not parse came back over a working connection, so it is
+	// the opposite of an outage however unlike a server reply it looks.
+	if errors.Is(err, ErrMalformedValue) {
+		return false
+	}
 	// Every error the server itself replied with implements redis.Error, so the
 	// connection was fine; anything else is a transport level problem.
 	var replyErr redis.Error
@@ -221,10 +226,20 @@ func (s *Store) Reset(ctx context.Context, action string, ts time.Time) error {
 	return s.SetHeartbeat(ctx, action, 0, ts)
 }
 
+// ErrMalformedValue reports a counter key holding something that is not an
+// integer, which means somebody else is writing into it. It is deliberately
+// distinct from an unreachable Redis: only one of the two means the instance
+// lost its connection, and the metrics exporter has to tell them apart.
+var ErrMalformedValue = errors.New("counter value is not an integer")
+
 // Counters returns the value of the integer counter of every action in one
 // round trip. An action whose key does not exist (never created, or expired) is
 // absent from the result rather than reported as a zero: the metrics exporter
 // must not invent a value that cannot be told from a counter really at zero.
+//
+// A key that cannot be parsed is skipped the same way and reported through an
+// ErrMalformedValue error, alongside the actions that did parse: one foreign
+// key must not black out the counters of every other word.
 func (s *Store) Counters(ctx context.Context, actions []string) (map[string]int64, error) {
 	if len(actions) == 0 {
 		return map[string]int64{}, nil
@@ -239,19 +254,25 @@ func (s *Store) Counters(ctx context.Context, actions []string) (map[string]int6
 	}
 
 	out := make(map[string]int64, len(actions))
+	var malformed []string
 	for i, v := range values {
 		if v == nil {
 			continue
 		}
 		raw, ok := v.(string)
 		if !ok {
-			return nil, fmt.Errorf("read counter %q: unexpected value type %T", actions[i], v)
+			malformed = append(malformed, actions[i])
+			continue
 		}
 		n, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("read counter %q: %w", actions[i], err)
+			malformed = append(malformed, actions[i])
+			continue
 		}
 		out[actions[i]] = n
+	}
+	if len(malformed) > 0 {
+		return out, fmt.Errorf("read counters of %s: %w", strings.Join(malformed, ", "), ErrMalformedValue)
 	}
 	return out, nil
 }

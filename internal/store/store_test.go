@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -252,13 +253,31 @@ func TestCounters(t *testing.T) {
 		t.Fatalf("Counters(nil) = %v, %v; want an empty result and no error", got, err)
 	}
 
-	// A value that is not an integer belongs to something else with the same
-	// key; report it instead of silently exporting a wrong number.
+	// A value that is not an integer belongs to something else writing into the
+	// same key. It is reported, but only that one word is lost: the reader gets
+	// everything it could parse, because one foreign key must not black out the
+	// whole picture.
 	if err := mr.Set(CounterKey(host, "getStatus"), "not-a-number"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.Counters(ctx, actions); err == nil {
-		t.Error("Counters must fail on a value that is not an integer")
+	got, err = st.Counters(ctx, actions)
+	if err == nil {
+		t.Fatal("Counters must report a value that is not an integer")
+	}
+	if !errors.Is(err, ErrMalformedValue) {
+		t.Errorf("error = %v, want it to wrap ErrMalformedValue", err)
+	}
+	if !strings.Contains(err.Error(), "getStatus") {
+		t.Errorf("error = %v, want it to name the action", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Counters = %v, want the parsable actions %v alongside the error", got, want)
+	}
+
+	// A broken value is not an outage: the caller has to be able to tell the two
+	// apart, because only one of them means "Redis is down".
+	if IsUnavailable(err) {
+		t.Error("a malformed value must not count as an unreachable Redis")
 	}
 }
 

@@ -1,15 +1,54 @@
 package metrics
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/snmp161/logstat/internal/config"
 	"github.com/snmp161/logstat/internal/counter"
+	"github.com/snmp161/logstat/internal/store"
 )
+
+// failingWriter is a ResponseWriter whose body writes always fail, the way a
+// client that hung up mid-response looks from the handler.
+type failingWriter struct{ header http.Header }
+
+func (w *failingWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = http.Header{}
+	}
+	return w.header
+}
+func (w *failingWriter) Write([]byte) (int, error) { return 0, errors.New("client is gone") }
+func (w *failingWriter) WriteHeader(int)           {}
+
+// A response that cannot be written is reported to the daemon log and nowhere
+// else: the status line has already gone out, so there is nothing left to tell
+// the client.
+func TestStatusPageReportsARenderFailure(t *testing.T) {
+	var buf bytes.Buffer
+	cfg := testConfig()
+	c := NewCollector(cfg, counter.New(cfg.Actions, true), &stubReader{}, Options{
+		Start: start,
+		Now:   func() time.Time { return scrapeTime },
+		Log:   slog.New(slog.NewTextHandler(&buf, nil)),
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	c.statusHandler().ServeHTTP(&failingWriter{}, req)
+
+	if !strings.Contains(buf.String(), "cannot render the status page") {
+		t.Fatalf("the failure did not reach the log: %q", buf.String())
+	}
+}
 
 func TestFormatUptime(t *testing.T) {
 	tests := []struct {
@@ -17,6 +56,8 @@ func TestFormatUptime(t *testing.T) {
 		want string
 	}{
 		{0, "0s"},
+		// A clock that went backwards must not render a negative uptime.
+		{-5 * time.Second, "0s"},
 		{45 * time.Second, "45s"},
 		{90 * time.Second, "1m 30s"},
 		{59*time.Minute + 59*time.Second, "59m 59s"},
@@ -111,6 +152,29 @@ func TestStatusPageWhileRedisIsDown(t *testing.T) {
 	}
 	if !strings.Contains(body, "get-number") {
 		t.Error("the in-memory numbers must still be listed during an outage")
+	}
+}
+
+// The header must read Redis the way the metric does: a key somebody else wrote
+// into is not an outage, and saying "unreachable" would send an operator
+// chasing the wrong problem.
+func TestStatusPageSeparatesAnOutageFromAnUnreadableKey(t *testing.T) {
+	cfg := testConfig()
+	rd := &stubReader{
+		counters: map[string]int64{"get-number": 12},
+		err:      fmt.Errorf("read counters of get-sms: %w", store.ErrMalformedValue),
+	}
+	_, base := newTestServerWith(t, cfg, counter.New(cfg.Actions, true), rd)
+
+	_, body := getFull(t, base+"/")
+	if strings.Contains(body, "unreachable") {
+		t.Errorf("an unreadable key must not be reported as an outage\nbody:\n%s", body)
+	}
+	if !strings.Contains(body, "12") {
+		t.Errorf("the keys that did parse must still be shown\nbody:\n%s", body)
+	}
+	if !strings.Contains(body, "get-sms") || !strings.Contains(body, "unreadable") {
+		t.Errorf("the page must point at the unreadable key\nbody:\n%s", body)
 	}
 }
 

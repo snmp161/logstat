@@ -54,6 +54,10 @@ type Daemon struct {
 	// metricsAddr is the address the exporter bound, empty while it is not
 	// running. Read by tests and by anything wanting the effective port.
 	metricsAddr atomic.Pointer[string]
+	// metricsErr carries an exporter that stopped on its own to the Run loop,
+	// which treats it as fatal. Buffered so the HTTP goroutine never blocks on
+	// a daemon that is already shutting down.
+	metricsErr chan error
 }
 
 // Option customises a Daemon.
@@ -82,6 +86,7 @@ func New(cfg *config.Config, lg *slog.Logger, st *store.Store, opts ...Option) *
 		pendingHeartbeats: make(map[string]int64),
 		pendingResets:     make(map[string]bool),
 		started:           time.Now(),
+		metricsErr:        make(chan error, 1),
 	}
 	for _, o := range opts {
 		o(d)
@@ -192,14 +197,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			d.log.Info("shutting down, flushing buffer")
-			// Stop the tailer first so that every line already read is counted.
-			if err := t.Stop(); err != nil {
-				d.log.Warn("tail stopped with error", "error", err)
-			}
-			wg.Wait()
-			d.Flush(context.WithoutCancel(ctx))
+			d.drain(ctx, t, &wg)
 			d.log.Info("stopped")
 			return nil
+
+		// The exporter died on its own. Counting on without the metrics that
+		// somebody switched on in the config would show the monitoring side
+		// silence and let it read as health, so this ends the daemon exactly
+		// like a port that could not be bound at startup — after the buffer has
+		// been written out.
+		case err := <-d.metricsErr:
+			d.log.Error("metrics exporter failed, shutting down", "error", err)
+			d.drain(ctx, t, &wg)
+			return err
 
 		case <-ticker.C:
 			d.Flush(ctx)
@@ -209,6 +219,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.Reset(ctx)
 		}
 	}
+}
+
+// drain stops the tailer and writes out what is buffered. The tailer goes first
+// so that every line it has already read is counted, and the flush runs on a
+// context of its own because the daemon context is usually already cancelled.
+func (d *Daemon) drain(ctx context.Context, t *tail.Tail, wg *sync.WaitGroup) {
+	if err := t.Stop(); err != nil {
+		d.log.Warn("tail stopped with error", "error", err)
+	}
+	wg.Wait()
+	d.Flush(context.WithoutCancel(ctx))
 }
 
 // startMetrics brings the Prometheus exporter up and returns the function that
@@ -240,8 +261,13 @@ func (d *Daemon) startMetrics() (stop func(), err error) {
 	served := make(chan struct{})
 	go func() {
 		defer close(served)
+		// A clean shutdown returns nil and must stay silent; anything else is
+		// the exporter dying under the daemon, which Run turns into an exit.
 		if err := srv.Serve(); err != nil {
-			d.log.Error("metrics exporter stopped", "error", err)
+			select {
+			case d.metricsErr <- err:
+			default:
+			}
 		}
 	}()
 
@@ -284,8 +310,13 @@ func (d *Daemon) Flush(ctx context.Context) {
 	deltas := d.cnt.Drain()
 	if len(deltas) == 0 && len(d.pendingHeartbeats) == 0 && len(d.pendingResets) == 0 {
 		// Nothing to write, but the keys of an idle action still must not expire
-		// while the daemon is running.
-		d.refreshTTL(ctx)
+		// while the daemon is running. That refresh is a Redis round trip like
+		// any other, so it is also what tells an idle daemon that an outage is
+		// over — otherwise the recovery would go unreported until the next line
+		// happens to match.
+		if d.refreshTTL(ctx) {
+			d.noteRedisOK()
+		}
 		d.log.Debug("flush: nothing to do")
 		return
 	}
@@ -328,7 +359,7 @@ func (d *Daemon) Flush(ctx context.Context) {
 		d.cnt.Restore(unwritten)
 	}
 	if !unreachable {
-		d.refreshTTL(ctx)
+		_ = d.refreshTTL(ctx)
 	}
 	if errs == 0 {
 		d.noteRedisOK()
@@ -438,16 +469,20 @@ func (d *Daemon) ensureInit(ctx context.Context) bool {
 
 // refreshTTL re-applies the key expiry. Keys of a live daemon must never expire,
 // so this runs on every flush; with expiry disabled there is nothing to refresh
-// (the one-off PERSIST already happened at startup).
-func (d *Daemon) refreshTTL(ctx context.Context) {
+// (the one-off PERSIST already happened at startup). It reports whether Redis
+// actually answered, which is not the same as "no error": with the expiry off
+// nothing is sent at all.
+func (d *Daemon) refreshTTL(ctx context.Context) (reachedRedis bool) {
 	if d.store.TTL() <= 0 || !d.initialized {
-		return
+		return false
 	}
 	octx, cancel := context.WithTimeout(context.WithoutCancel(ctx), opTimeout)
 	defer cancel()
 	if err := d.store.Touch(octx, d.cfg.Actions); err != nil {
 		d.noteRedisError("refresh ttl", err)
+		return false
 	}
+	return true
 }
 
 // noteRedisError logs the first error of an outage at warn level and keeps the

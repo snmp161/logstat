@@ -198,7 +198,9 @@ Descriptors such as `@daily` and `@hourly` are accepted too. The six-field synta
 
 With `reset.enabled: false` the daemon only counts; the zeroing is done by something else (an external script or timer, or a manual `logstat clear`).
 
-**Validation at startup.** The config is parsed strictly: an unknown field is an error. The daemon checks that `actions` is not empty, that `flush_interval > 0`, that `lock_file` is set and its directory can be created, that `reset.schedule` is a valid 5-field cron expression, that `logging.level` and `logging.output` are from the allowed sets, and that with `output: file` the `logging.file` field is non-empty and the path writable. `metrics.listen` has to parse as `host:port` with a port in 1..65535, and `metrics.path` has to start with a slash and carry neither braces nor whitespace — all of it checked whether or not the exporter is enabled, so that a typo does not wait for the day someone turns it on. The values of `poll`, `heartbeat_key`, `case_sensitive` and `metrics.enabled` must be booleans and `redis.ttl` must not be negative. A fatal config error exits with a non-zero code, which systemd shows in the unit status. Duplicates in `actions`, words that are a substring of another one and — with `case_sensitive: no` — words differing only in case produce a warning in the log but do not prevent the start.
+The interval boundary holds only while Redis is reachable. If the schedule fires during an outage, the final flush cannot happen, the zeroing is deferred, and on recovery the order comes out as "zero first, flush after": the lines of the finished interval land in the new one. The alternative would be to throw them away, and shifting data by one interval beats losing it.
+
+**Validation at startup.** The config is parsed strictly: an unknown field is an error. The daemon checks that `actions` is not empty, that `flush_interval > 0`, that `lock_file` is set and its directory can be created, that `reset.schedule` is a valid 5-field cron expression, that `logging.level` and `logging.output` are from the allowed sets, and that with `output: file` the `logging.file` field is non-empty and the path writable. `metrics.listen` has to parse as `host:port` with a port in 1..65535, and `metrics.path` has to start with a slash and carry neither braces nor whitespace — all of it checked whether or not the exporter is enabled, so that a typo does not wait for the day someone turns it on. Validation does not stop at the first problem: the whole config is checked and every fatal error is reported at once, separated by `; `, instead of turning a handful of typos into a fix-restart-repeat loop. The values of `poll`, `heartbeat_key`, `case_sensitive` and `metrics.enabled` must be booleans and `redis.ttl` must not be negative. A fatal config error exits with a non-zero code, which systemd shows in the unit status. Duplicates in `actions`, words that are a substring of another one and — with `case_sensitive: no` — words differing only in case produce a warning in the log but do not prevent the start.
 
 ## CLI
 
@@ -309,7 +311,7 @@ logstat_uptime_seconds 3600
 |---|---|---|---|
 | `logstat_uptime_seconds` | gauge | — | how long this process has been running |
 | `logstat_start_time_seconds` | gauge | — | unix timestamp of the start |
-| `logstat_config_info` | gauge | `log_path`, `lock_file`, `host`, `redis_addr`, `redis_db`, `redis_password_set`, `logging_level`, `logging_output`, `logging_file`, `reset_schedule`, `metrics_listen`, `metrics_path` | always `1`; the configuration this instance runs with |
+| `logstat_config_info` | gauge | `log_path`, `host`, `redis_addr`, `redis_db`, `redis_password_set`, `logging_output`, `reset_schedule` | always `1`; the configuration this instance runs with |
 | `logstat_config_flush_interval_seconds` | gauge | — | `flush_interval` |
 | `logstat_config_redis_ttl_seconds` | gauge | — | `redis.ttl`, `0` meaning no expiry |
 | `logstat_config_case_sensitive` | gauge | — | `case_sensitive` as `1`/`0` |
@@ -321,7 +323,7 @@ logstat_uptime_seconds 3600
 | `logstat_matched_lines_total` | counter | `action` | matches of the word since the start (the in-memory counter) |
 | `logstat_pending_increments` | gauge | `action` | buffered, not yet flushed to Redis |
 | `logstat_redis_counter` | gauge | `action` | value of `logstat:counter:<host>:<action>`, read during the scrape |
-| `logstat_redis_up` | gauge | — | `1` if this scrape could read Redis |
+| `logstat_redis_up` | gauge | — | `1` if Redis answered this scrape, even if one of the keys held something unreadable |
 | `logstat_redis_scrape_errors_total` | counter | — | scrapes that failed to read Redis |
 
 The standard `go_*` and `process_*` collectors of `client_golang` are exported as well.
@@ -360,11 +362,11 @@ rendered 2026-08-22 16:06:07 MSK · reload to refresh
 
 It is a summary on one screen, not a dashboard: no graphs, no history, no auto-refresh (reload the page instead — an abandoned browser tab must not keep hammering Redis), and nothing that can change the state of the daemon. Graphs and alerts are what Prometheus and Grafana are for.
 
-The three columns per word are the three numbers that can disagree, side by side: `in memory` is what this process has matched since it started, `buffered` is what is still waiting for the next flush, `in redis` is the shared total the external reader sees. A missing key shows as `—` rather than `0`, the same way it is a missing series in the metrics. With Redis unreachable the page still renders and says so in the header.
+The three columns per word are the three numbers that can disagree, side by side: `in memory` is what this process has matched since it started, `buffered` is what is still waiting for the next flush, `in redis` is the shared total the external reader sees. A missing key shows as `—` rather than `0`, the same way it is a missing series in the metrics. With Redis unreachable the page still renders and says so in the header. The header follows the same rule as `logstat_redis_up`: "unreachable" means Redis did not answer, while a single key holding something unreadable shows as `—` in its row and as a note beside the status.
 
 Like the metrics, the page never shows the Redis password — only whether one is configured.
 
-With `metrics.path: /` the exposition takes the root and there is no status page.
+With `metrics.path: /` the exposition takes the root, serves on **every** path, and there is no status page. A trailing slash is refused for the same reason: to `net/http` a pattern like `/metrics/` is a subtree, and the metrics would answer on `/metrics/anything` too.
 
 The path is taken literally. Braces and whitespace are rejected by the validation, because the `net/http` router reads `{...}` as a wildcard — `/{env}` would serve the metrics on any one-segment path — and panics outright on a broken pattern such as `/met{rics`. The exporter repeats the check on its own input, so no caller can bring the process down with a panic instead of a config error.
 
@@ -376,7 +378,13 @@ Every configured word appears in `logstat_matched_lines_total` and `logstat_pend
 
 The values behind `logstat_redis_counter` are read during the scrape, in one `MGET` with a 2 s timeout (comfortably below the usual `scrape_timeout`). A scrape neither blocks nor takes the daemon down: with Redis unreachable the endpoint still answers, but `logstat_redis_up` is `0`, the `logstat_redis_counter` series are absent and `logstat_redis_scrape_errors_total` grows. A missing key means a missing series rather than a `0` — an invented zero is indistinguishable from a counter that was honestly zeroed.
 
+`logstat_redis_up` answers exactly one question: did Redis answer? A key holding something that is not a number (somebody else writing into it) is not a connectivity failure — `up` stays `1`, that one word is skipped like a missing key, the other words are exported as usual, and the fact shows up in `logstat_redis_scrape_errors_total` and in the daemon log. Otherwise one foreign key would black out the whole picture and read as an outage.
+
 **A failed bind is fatal.** With `metrics.enabled: true` and the port already taken the daemon exits with a non-zero code and systemd shows the reason in the unit status. Running on silently without metrics that were explicitly switched on is worse: the monitoring side would see silence and conclude everything is fine. The socket is opened **before** the log file is tailed, so the failure happens immediately rather than after the first flush.
+
+**So is the exporter dying later.** If the HTTP server stops with an error while the daemon runs, the daemon flushes what it has and exits non-zero instead of counting on without metrics — the same argument as for the bind, only deferred. Stopping the server as part of a normal shutdown is not an error.
+
+Timeouts on that server: `ReadHeaderTimeout` 5 s, `WriteTimeout` 30 s, `IdleTimeout` 60 s. The write timeout is comfortably above the 2 s Redis read, so a slow Redis cannot cut a scrape in half.
 
 A scrape config for a host running several instances:
 
@@ -387,7 +395,7 @@ scrape_configs:
       - targets: ["app1.example.com:9843", "app1.example.com:9844"]
 ```
 
-The endpoint has no TLS, no authentication and no rate limiting — that is out of scope by design. The default `listen` is loopback only; publishing it is the operator's deliberate act, ideally behind a firewall or a reverse proxy.
+**Before you publish the port.** The endpoint has no TLS, no authentication and no rate limiting — all three are out of scope by design, and the default `listen` is loopback only. Anyone who can reach the port reads the log path, the lock file, the Redis address and database, the code words, the schedule and the version, and every page load costs one `MGET` against Redis. The password is the one thing that stays inside the process. If the metrics have to leave the host, put a firewall or a reverse proxy (TLS plus auth) in front of them rather than binding `0.0.0.0` and hoping.
 
 ## The daemon's own log
 
@@ -456,7 +464,7 @@ make test     # go test -race ./...
 make cover    # plus a coverage profile and the resulting number
 ```
 
-No external services are needed: Redis is replaced by [miniredis](https://github.com/alicebob/miniredis) and log files are created in temporary directories. The suite covers matching (substring, both case modes, per-line counting, prefix overlaps), the config parser and validator (including the `case_sensitive` default, its warnings and an end-to-end run in the case-insensitive mode), key and value formatting, assembling `lines=<N>` from the `INCRBY` reply, the `heartbeat_key: false` mode, setting and renewing the TTL on both keys (including an abandoned key expiring and the expiry being cleared with `ttl: 0`), computing the next firing time of cron schedules, tailing across both rotation schemes, starting with the log file absent, behaviour with Redis unavailable and catching up after recovery, resetting the counters (both directly and through the scheduler on an every-second schedule, without waiting for real cron), log level filtering and log file reopening, single-instance enforcement through `flock`, and a graceful shutdown on a real `SIGTERM` in a separate process. The exporter is covered from both ends: the collector against a fake clock (uptime, every config value, the per-word series starting at zero, the totals surviving a drain of the buffer, the password never being rendered) and the endpoint over real HTTP (`200` on the configured path, the status page on the root and `404` elsewhere, values that follow miniredis, `logstat_redis_up 0` with Redis down, no socket at all when disabled, and a taken port failing the start).
+No external services are needed: Redis is replaced by [miniredis](https://github.com/alicebob/miniredis) and log files are created in temporary directories. The suite covers matching (substring, both case modes, per-line counting, prefix overlaps), the config parser and validator (including the `case_sensitive` default, its warnings and an end-to-end run in the case-insensitive mode), key and value formatting, assembling `lines=<N>` from the `INCRBY` reply, the `heartbeat_key: false` mode, setting and renewing the TTL on both keys (including an abandoned key expiring and the expiry being cleared with `ttl: 0`), computing the next firing time of cron schedules, tailing across both rotation schemes, starting with the log file absent, behaviour with Redis unavailable and catching up after recovery, resetting the counters (both directly and through the scheduler on an every-second schedule, without waiting for real cron), log level filtering and log file reopening, single-instance enforcement through `flock`, and a graceful shutdown on a real `SIGTERM` in a separate process. The exporter is covered from both ends: the collector against a fake clock (uptime, every config value, the per-word series starting at zero, the totals surviving a drain of the buffer, the password never being rendered) and the endpoint over real HTTP (`200` on the configured path, the status page on the root and `404` elsewhere, values that follow miniredis, `logstat_redis_up 0` with Redis down, no socket at all when disabled, a taken port failing the start, and an exporter that dies mid-run taking the daemon down with it).
 
 ## License
 
