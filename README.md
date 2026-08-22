@@ -12,6 +12,7 @@ Implemented in Go as a static binary (`CGO_ENABLED=0`), configured through YAML.
 - [Redis keys](#redis-keys)
   - [Key expiry](#key-expiry)
 - [Configuration](#configuration)
+  - [Case sensitivity](#case-sensitivity)
 - [CLI](#cli)
 - [Building](#building)
 - [Installing the package](#installing-the-package)
@@ -26,7 +27,7 @@ Implemented in Go as a static binary (`CGO_ENABLED=0`), configured through YAML.
 ## How it works
 
 1. The daemon follows the log file the way `tail -F` does. An existing file is opened **at its end** (like `tail -n0`) — whatever was written before the start is not counted. If the file does not exist yet (the source software may come up later), the daemon does not fail: it waits for the file to appear and then reads it **from the beginning**.
-2. Every new line is checked against each code word: **substring anywhere in the line, case-sensitive**. Counting is **per line, not per occurrence** — a word occurring twice in one line still adds 1. Two different words in one line increment both.
+2. Every new line is checked against each code word: **substring anywhere in the line**, case-sensitively by default and case-insensitively with `case_sensitive: no` ([details](#case-sensitivity)). Counting is **per line, not per occurrence** — a word occurring twice in one line still adds 1. Two different words in one line increment both.
 3. Increments accumulate in memory and are flushed to Redis in one batch every `flush_interval` seconds instead of on every line. A flush issues `INCRBY` on the integer counter and then — if `heartbeat_key` is on — `SET`s the formatted heartbeat value with the new total taken from the `INCRBY` reply.
 4. Log rotation is handled transparently in both logrotate modes: `create` (rename plus a new file, so the inode changes) and `copytruncate` (truncation in place). No line is lost and none is counted twice.
 5. On the `reset.schedule` cron schedule the counters are zeroed: the rest of the buffer is flushed first (so the lines of the finishing interval are accounted for in it), then `SET counter 0` plus a heartbeat value of `lines=0`.
@@ -98,6 +99,7 @@ actions:
   - getNumber
   - getStatus
 
+case_sensitive: yes
 flush_interval: 10
 poll: false
 heartbeat_key: true
@@ -124,6 +126,7 @@ reset:
 |---|---|---|---|
 | `log_path` | string | `/var/log/app.log` | path to the watched log file |
 | `actions` | list\<string\> | `[get-number, get-sms, getNumber, getStatus]` | code words |
+| `case_sensitive` | bool | `true` | match the code words case-sensitively; `no` matches any case |
 | `flush_interval` | int (sec) | `10` | how often the buffer is flushed to Redis |
 | `poll` | bool | `false` | poll instead of using inotify (for network file systems) |
 | `heartbeat_key` | bool | `true` | maintain the heartbeat key `logstat:heartbeat:<host>:<action>` |
@@ -139,6 +142,38 @@ reset:
 | `reset.enabled` | bool | `true` | enable the self-reset |
 | `reset.schedule` | string | `"0 0 * * *"` | cron schedule of the reset (standard 5-field) |
 
+### Case sensitivity
+
+`case_sensitive` decides how the substring search compares the code words with the line. Being a YAML boolean, it accepts `yes`/`no` as readily as `true`/`false`.
+
+| Value | Behaviour |
+|---|---|
+| `yes` (default) | byte-for-byte comparison: `get-number` matches `get-number` only, not `GET-NUMBER` and not `Get-Number` |
+| `no` | the line and the code words are lowercased before the search, so every spelling of a word feeds the same counter |
+
+```yaml
+actions:
+  - get-number
+case_sensitive: no
+```
+
+With that config all three lines below add 1 to the counter of `get-number`:
+
+```
+"GET /api/get-number?x=1 HTTP/1.1" 200
+"GET /api/GET-NUMBER?x=1 HTTP/1.1" 200
+"GET /api/Get-Number?x=1 HTTP/1.1" 200
+```
+
+The default is `yes`, so an existing config keeps the behaviour it had before this option existed.
+
+Case folding affects **matching only**. The Redis keys and the heartbeat value always spell the word the way `actions` does, never the way the line does, so `logstat:counter:<host>:get-number` stays the one key of that word whichever spelling was in the log — and flipping the option does not move a running count to a different key.
+
+Two consequences worth knowing before switching the option off:
+
+- Prefix overlaps are then judged without case too, so a pair like `getstatus` / `GetStatusExtended` starts warning at startup although it is silent in the case-sensitive mode.
+- Words that differ **only** in case (`getNumber` and `GETNUMBER`) always match together but keep two separate Redis keys — almost certainly a config mistake. The daemon warns about such a pair and keeps both words: dropping one of them would silently abandon a key that a reader may already be sampling.
+
 **The reset schedule.** `reset.schedule` is a standard 5-field cron expression (`minute hour day-of-month month day-of-week`), interpreted in the host's local timezone, always firing at `:00` seconds of the target minute. There is no hand-written time logic, so the flexibility comes for free:
 
 | Expression | Meaning |
@@ -152,7 +187,7 @@ Descriptors such as `@daily` and `@hourly` are accepted too. The six-field synta
 
 With `reset.enabled: false` the daemon only counts; the zeroing is done by something else (an external script or timer, or a manual `logstat clear`).
 
-**Validation at startup.** The config is parsed strictly: an unknown field is an error. The daemon checks that `actions` is not empty, that `flush_interval > 0`, that `lock_file` is set and its directory can be created, that `reset.schedule` is a valid 5-field cron expression, that `logging.level` and `logging.output` are from the allowed sets, and that with `output: file` the `logging.file` field is non-empty and the path writable. The values of `poll` and `heartbeat_key` must be booleans and `redis.ttl` must not be negative. A fatal config error exits with a non-zero code, which systemd shows in the unit status. Duplicates in `actions` and words that are a substring of another one produce a warning in the log but do not prevent the start.
+**Validation at startup.** The config is parsed strictly: an unknown field is an error. The daemon checks that `actions` is not empty, that `flush_interval > 0`, that `lock_file` is set and its directory can be created, that `reset.schedule` is a valid 5-field cron expression, that `logging.level` and `logging.output` are from the allowed sets, and that with `output: file` the `logging.file` field is non-empty and the path writable. The values of `poll`, `heartbeat_key` and `case_sensitive` must be booleans and `redis.ttl` must not be negative. A fatal config error exits with a non-zero code, which systemd shows in the unit status. Duplicates in `actions`, words that are a substring of another one and — with `case_sensitive: no` — words differing only in case produce a warning in the log but do not prevent the start.
 
 ## CLI
 
@@ -164,7 +199,7 @@ logstat version                               version, commit, build date
 logstat --help                                help
 ```
 
-`clear` works at any time, regardless of `reset.enabled`, and zeroes both the integer counter and the heartbeat value (`lines=0`; with `heartbeat_key: false` the heartbeat is left alone). `--action` only accepts a word listed in the `actions` of that config, so a typo cannot create a stray key.
+`clear` works at any time, regardless of `reset.enabled`, and zeroes both the integer counter and the heartbeat value (`lines=0`; with `heartbeat_key: false` the heartbeat is left alone). `--action` only accepts a word listed in the `actions` of that config, so a typo cannot create a stray key. It is matched against the config exactly, `case_sensitive` notwithstanding: the option governs the search in the log, not the key names.
 
 Exit codes: `0` success, `1` runtime failure (config, lock, Redis), `2` usage error.
 
@@ -264,7 +299,7 @@ sudo systemctl edit logstat@app1.service
 
 ## Operator warnings
 
-**Prefix overlaps in `actions`.** Matching is substring based, so a word that is part of another word from the list increments both counters: `getStatus` also matches inside a hypothetical `getStatusExtended`. The four default words do not overlap (none of them is a substring of another). Adding new words calls for a check — at startup the daemon logs a warning for every such pair, but it does not refuse to run.
+**Prefix overlaps in `actions`.** Matching is substring based, so a word that is part of another word from the list increments both counters: `getStatus` also matches inside a hypothetical `getStatusExtended`. The four default words do not overlap (none of them is a substring of another). Adding new words calls for a check — at startup the daemon logs a warning for every such pair, but it does not refuse to run. With [`case_sensitive: no`](#case-sensitivity) the overlap is judged without case, which turns pairs like `getstatus` / `GetStatusExtended` into overlaps as well.
 
 **A possible key collision.** The keys contain only `<host>` and `<action>`. A collision is possible in exactly one scenario: several instances on one host configured with the **same** Redis (host/port/db) **and** overlapping `actions` — then they write to a shared key and overwrite each other. This is normally not the case: different configs usually mean a different Redis (its own host/db in each), and if Redis really is shared, non-overlapping `actions` sets are enough. The software does **not** prevent this case; it is the operator's responsibility.
 
@@ -295,7 +330,7 @@ make test     # go test -race ./...
 make cover    # plus a coverage profile and the resulting number
 ```
 
-No external services are needed: Redis is replaced by [miniredis](https://github.com/alicebob/miniredis) and log files are created in temporary directories. The suite covers matching (substring, case sensitivity, per-line counting, prefix overlaps), the config parser and validator, key and value formatting, assembling `lines=<N>` from the `INCRBY` reply, the `heartbeat_key: false` mode, setting and renewing the TTL on both keys (including an abandoned key expiring and the expiry being cleared with `ttl: 0`), computing the next firing time of cron schedules, tailing across both rotation schemes, starting with the log file absent, behaviour with Redis unavailable and catching up after recovery, resetting the counters (both directly and through the scheduler on an every-second schedule, without waiting for real cron), log level filtering and log file reopening, single-instance enforcement through `flock`, and a graceful shutdown on a real `SIGTERM` in a separate process.
+No external services are needed: Redis is replaced by [miniredis](https://github.com/alicebob/miniredis) and log files are created in temporary directories. The suite covers matching (substring, both case modes, per-line counting, prefix overlaps), the config parser and validator (including the `case_sensitive` default, its warnings and an end-to-end run in the case-insensitive mode), key and value formatting, assembling `lines=<N>` from the `INCRBY` reply, the `heartbeat_key: false` mode, setting and renewing the TTL on both keys (including an abandoned key expiring and the expiry being cleared with `ttl: 0`), computing the next firing time of cron schedules, tailing across both rotation schemes, starting with the log file absent, behaviour with Redis unavailable and catching up after recovery, resetting the counters (both directly and through the scheduler on an every-second schedule, without waiting for real cron), log level filtering and log file reopening, single-instance enforcement through `flock`, and a graceful shutdown on a real `SIGTERM` in a separate process.
 
 ## License
 

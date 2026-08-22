@@ -20,6 +20,9 @@ func TestDefaults(t *testing.T) {
 	if len(cfg.Actions) != 4 || cfg.Actions[0] != "get-number" || cfg.Actions[3] != "getStatus" {
 		t.Errorf("actions = %v, want %v", cfg.Actions, want.Actions)
 	}
+	if !cfg.CaseSensitive {
+		t.Error("case_sensitive = false, want true by default")
+	}
 	if cfg.FlushInterval != 10 {
 		t.Errorf("flush_interval = %d, want 10", cfg.FlushInterval)
 	}
@@ -66,6 +69,9 @@ func TestPartialConfigKeepsDefaults(t *testing.T) {
 	if !cfg.HeartbeatKey {
 		t.Fatalf("heartbeat_key default lost: %+v", cfg)
 	}
+	if !cfg.CaseSensitive {
+		t.Fatalf("case_sensitive default lost: %+v", cfg)
+	}
 	if cfg.Redis.TTL != 86400 {
 		t.Fatalf("redis.ttl default lost: %+v", cfg)
 	}
@@ -77,6 +83,7 @@ log_path: /var/log/nginx/access.log
 actions:
   - alpha
   - beta
+case_sensitive: no
 flush_interval: 5
 poll: true
 heartbeat_key: false
@@ -105,6 +112,9 @@ reset:
 	if cfg.HeartbeatKey {
 		t.Error("heartbeat_key = true, want the configured false")
 	}
+	if cfg.CaseSensitive {
+		t.Error("case_sensitive = true, want the configured no")
+	}
 	if cfg.Redis.Addr() != "10.0.0.5:6380" || cfg.Redis.DB != 3 || cfg.Redis.Password != "secret" {
 		t.Errorf("redis = %+v", cfg.Redis)
 	}
@@ -130,6 +140,7 @@ func TestParseErrors(t *testing.T) {
 		{"broken yaml", "actions: [unclosed\n"},
 		{"wrong type", "flush_interval: not-a-number\n"},
 		{"wrong bool", "heartbeat_key: yesplease\n"},
+		{"wrong bool for case_sensitive", "case_sensitive: sometimes\n"},
 		{"unknown field", "flush_intervals: 10\n"},
 	}
 	for _, tc := range tests {
@@ -222,8 +233,117 @@ func TestValidateWarnsOnSubstringActions(t *testing.T) {
 }
 
 func TestDefaultActionsDoNotOverlap(t *testing.T) {
-	if w := Overlaps(Default().Actions); len(w) != 0 {
-		t.Fatalf("default actions must not overlap, got %v", w)
+	for _, caseSensitive := range []bool{true, false} {
+		if w := Overlaps(Default().Actions, caseSensitive); len(w) != 0 {
+			t.Fatalf("default actions must not overlap (case_sensitive=%v), got %v", caseSensitive, w)
+		}
+	}
+}
+
+// case_sensitive is a plain YAML boolean, so the yes/no spelling the README
+// uses has to parse just like true/false.
+func TestParseCaseSensitiveAcceptsYesNo(t *testing.T) {
+	tests := []struct {
+		yaml string
+		want bool
+	}{
+		{"case_sensitive: yes\n", true},
+		{"case_sensitive: no\n", false},
+		{"case_sensitive: true\n", true},
+		{"case_sensitive: false\n", false},
+	}
+	for _, tc := range tests {
+		t.Run(strings.TrimSpace(tc.yaml), func(t *testing.T) {
+			cfg, err := Parse([]byte(tc.yaml))
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tc.yaml, err)
+			}
+			if cfg.CaseSensitive != tc.want {
+				t.Fatalf("case_sensitive = %v, want %v", cfg.CaseSensitive, tc.want)
+			}
+			if _, err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+		})
+	}
+}
+
+// An overlap that only exists once the case is folded away is invisible in the
+// default mode and a real overlap in the case-insensitive one.
+func TestOverlapWarningsFollowTheCaseMode(t *testing.T) {
+	actions := []string{"getstatus", "GetStatusExtended"}
+
+	cfg := Default()
+	cfg.Actions = actions
+	warnings, err := cfg.Validate()
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("case-sensitive warnings = %v, want none: the spellings differ", warnings)
+	}
+
+	cfg = Default()
+	cfg.Actions = actions
+	cfg.CaseSensitive = false
+	warnings, err = cfg.Validate()
+	if err != nil {
+		t.Fatalf("overlapping actions must be a warning, not an error: %v", err)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], `"getstatus"`) {
+		t.Fatalf("case-insensitive warnings = %v, want one about %q", warnings, "getstatus")
+	}
+}
+
+// Words differing only in case always match together but keep two Redis keys,
+// which is worth a warning of its own — one per pair, not one per direction.
+// They are not duplicates: dropping one would abandon a key that is already
+// being written to.
+func TestValidateWarnsOnActionsDifferingOnlyInCase(t *testing.T) {
+	cfg := Default()
+	cfg.Actions = []string{"getNumber", "GETNUMBER"}
+	cfg.CaseSensitive = false
+
+	warnings, err := cfg.Validate()
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if len(cfg.Actions) != 2 {
+		t.Fatalf("actions = %v, words differing in case must both be kept", cfg.Actions)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "case") {
+		t.Fatalf("warnings = %v, want exactly one about the case", warnings)
+	}
+
+	// The same pair is two ordinary, non-overlapping words when the case counts.
+	cfg.CaseSensitive = true
+	warnings, err = cfg.Validate()
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("case-sensitive warnings = %v, want none", warnings)
+	}
+}
+
+// Exact duplicates are dropped in either mode, and dropping them must not
+// depend on the case setting.
+func TestDuplicateActionsAreDroppedInBothCaseModes(t *testing.T) {
+	for _, caseSensitive := range []bool{true, false} {
+		cfg := Default()
+		cfg.Actions = []string{"a", "b", "a"}
+		cfg.CaseSensitive = caseSensitive
+
+		warnings, err := cfg.Validate()
+		if err != nil {
+			t.Fatalf("case_sensitive=%v: %v", caseSensitive, err)
+		}
+		if len(cfg.Actions) != 2 {
+			t.Fatalf("case_sensitive=%v: actions = %v, want the duplicate dropped", caseSensitive, cfg.Actions)
+		}
+		if len(warnings) != 1 || !strings.Contains(warnings[0], "more than once") {
+			t.Fatalf("case_sensitive=%v: warnings = %v", caseSensitive, warnings)
+		}
 	}
 }
 

@@ -186,6 +186,45 @@ func TestFlushWritesCounterAndHeartbeat(t *testing.T) {
 	}
 }
 
+// The daemon has to hand case_sensitive to the counter it builds, and the case
+// of the log line must not reach the key names: whatever the line looked like,
+// the total belongs to the word as spelled in actions.
+func TestFlushInCaseInsensitiveMode(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.CaseSensitive = false })
+
+	h.d.Counter().ProcessLine("a GET-NUMBER b")
+	h.d.Counter().ProcessLine("a Get-Number and getstatus b")
+	h.d.Flush(context.Background())
+
+	if got := h.counter(t, "get-number"); got != "2" {
+		t.Errorf("get-number counter = %s, want 2", got)
+	}
+	if got := h.counter(t, "getStatus"); got != "1" {
+		t.Errorf("getStatus counter = %s, want 1", got)
+	}
+	if got := h.heartbeat(t, "getStatus"); !strings.Contains(got, "type=getStatus") {
+		t.Errorf("getStatus heartbeat = %q, want the configured spelling", got)
+	}
+	for _, key := range h.mr.Keys() {
+		if strings.Contains(key, "GET-NUMBER") || strings.Contains(key, "getstatus") {
+			t.Errorf("key %q takes its spelling from the log line, keys = %v", key, h.mr.Keys())
+		}
+	}
+}
+
+// The default mode is unchanged by the new option: a differently cased line is
+// simply not a match.
+func TestFlushInCaseSensitiveModeIgnoresOtherSpellings(t *testing.T) {
+	h := newHarness(t, nil)
+
+	h.d.Counter().ProcessLine("a GET-NUMBER b")
+	h.d.Flush(context.Background())
+
+	if got := h.counter(t, "get-number"); got != "0" {
+		t.Errorf("get-number counter = %s, want 0", got)
+	}
+}
+
 // With heartbeat_key off the daemon maintains the integer counters only.
 func TestFlushWithoutHeartbeatKey(t *testing.T) {
 	h := newHarness(t, func(c *config.Config) { c.HeartbeatKey = false })
@@ -511,6 +550,23 @@ func TestRunSkipsPreexistingLinesAndCountsNewOnes(t *testing.T) {
 	if got := h.counter(t, "get-sms"); got != "0" {
 		t.Errorf("get-sms = %s, want 0: lines written before the start must be ignored", got)
 	}
+}
+
+// The whole path from the tailed line to the Redis key in the case-insensitive
+// mode: a line whose spelling differs from the config still lands on the key of
+// the configured word.
+func TestRunCountsAnyCaseWhenCaseSensitiveIsOff(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: tails a real file over several seconds")
+	}
+	h := newHarness(t, func(c *config.Config) { c.CaseSensitive = false })
+
+	runDaemon(t, h.d)
+	h.waitTailStarted(t)
+	waitTailAttached(t, h)
+
+	appendLines(t, h.cfg.LogPath, "new GET-NUMBER", "new Get-Number")
+	h.waitFor(t, "both spellings on one key", func() bool { return h.counter(t, "get-number") == "2" })
 }
 
 func TestRunSurvivesRotation(t *testing.T) {

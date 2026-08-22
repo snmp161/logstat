@@ -63,15 +63,18 @@ type Reset struct {
 
 // Config is the full daemon configuration.
 type Config struct {
-	LogPath       string   `yaml:"log_path"`
-	Actions       []string `yaml:"actions"`
-	FlushInterval int      `yaml:"flush_interval"`
-	Poll          bool     `yaml:"poll"`
-	HeartbeatKey  bool     `yaml:"heartbeat_key"`
-	LockFile      string   `yaml:"lock_file"`
-	Redis         Redis    `yaml:"redis"`
-	Logging       Logging  `yaml:"logging"`
-	Reset         Reset    `yaml:"reset"`
+	LogPath string   `yaml:"log_path"`
+	Actions []string `yaml:"actions"`
+	// CaseSensitive selects how the actions are matched against a log line:
+	// byte for byte (the default) or with both sides lowercased first.
+	CaseSensitive bool    `yaml:"case_sensitive"`
+	FlushInterval int     `yaml:"flush_interval"`
+	Poll          bool    `yaml:"poll"`
+	HeartbeatKey  bool    `yaml:"heartbeat_key"`
+	LockFile      string  `yaml:"lock_file"`
+	Redis         Redis   `yaml:"redis"`
+	Logging       Logging `yaml:"logging"`
+	Reset         Reset   `yaml:"reset"`
 }
 
 // Default returns the configuration used when the YAML file omits fields.
@@ -79,6 +82,7 @@ func Default() Config {
 	return Config{
 		LogPath:       "/var/log/app.log",
 		Actions:       []string{"get-number", "get-sms", "getNumber", "getStatus"},
+		CaseSensitive: true,
 		FlushInterval: 10,
 		Poll:          false,
 		HeartbeatKey:  true,
@@ -161,7 +165,7 @@ func (c *Config) Validate() ([]string, error) {
 		uniq = append(uniq, a)
 	}
 	c.Actions = uniq
-	warnings = append(warnings, Overlaps(c.Actions)...)
+	warnings = append(warnings, Overlaps(c.Actions, c.CaseSensitive)...)
 
 	if c.FlushInterval <= 0 {
 		return warnings, fmt.Errorf("flush_interval must be > 0, got %d", c.FlushInterval)
@@ -229,14 +233,39 @@ func ParseSchedule(expr string) (cron.Schedule, error) {
 
 // Overlaps reports actions that are a substring of another action. Substring
 // matching makes such a pair count the same line twice, which is rarely intended.
-func Overlaps(actions []string) []string {
+// The comparison follows the matching mode: with caseSensitive false the case is
+// folded away first, so words that overlap only in that mode are reported too.
+//
+// A pair differing only in case is a special case of that: the two words always
+// match together yet keep two separate Redis keys. It gets a warning of its own,
+// once per pair rather than once per direction.
+func Overlaps(actions []string, caseSensitive bool) []string {
+	needles := make([]string, len(actions))
+	for i, a := range actions {
+		if caseSensitive {
+			needles[i] = a
+		} else {
+			needles[i] = strings.ToLower(a)
+		}
+	}
+
 	var warnings []string
 	for i, a := range actions {
 		for j, b := range actions {
 			if i == j || a == "" || b == "" {
 				continue
 			}
-			if strings.Contains(b, a) {
+			if needles[i] == needles[j] {
+				// Only reachable without case sensitivity: exact duplicates are
+				// dropped before the check.
+				if i < j {
+					warnings = append(warnings, fmt.Sprintf(
+						"actions %q and %q differ only in case: with case_sensitive: no they match the same lines but keep two separate counters",
+						a, b))
+				}
+				continue
+			}
+			if strings.Contains(needles[j], needles[i]) {
 				warnings = append(warnings, fmt.Sprintf(
 					"action %q is a substring of action %q: every line matching %q also increments %q",
 					a, b, b, a))

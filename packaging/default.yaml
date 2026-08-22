@@ -10,8 +10,8 @@
 # Path to the watched log file. Any software writing line by line will do.
 log_path: /var/log/app.log
 
-# Code words to count. Matching is a case-sensitive substring search anywhere in
-# the line, counted once per line.
+# Code words to count. Matching is a substring search anywhere in the line,
+# counted once per line.
 # WARNING: avoid words that are a substring of another word in this list —
 # "getStatus" would also be counted inside "getStatusExtended". logstat logs a
 # warning at startup when it finds such a pair.
@@ -20,6 +20,13 @@ actions:
   - get-sms
   - getNumber
   - getStatus
+
+# Take the case into account when matching. yes (the default) compares byte for
+# byte, so only "get-number" matches "get-number"; no lowercases both the line
+# and the code words first, so "GET-NUMBER" and "Get-Number" match as well.
+# Only matching is affected: the Redis keys always spell the word the way this
+# list does, never the way the log line does.
+case_sensitive: yes
 
 # How often the in-memory buffer is flushed to Redis, in seconds.
 flush_interval: 10

@@ -63,7 +63,7 @@ func TestProcessLine(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			c := New(defaultActions)
+			c := New(defaultActions, true)
 			got := c.ProcessLine(tc.line)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("ProcessLine(%q) = %v, want %v", tc.line, got, tc.want)
@@ -85,7 +85,7 @@ func (c *Counter) Drain0(action string) int64 {
 }
 
 func TestMatchIsIndependentOfOrder(t *testing.T) {
-	c := New([]string{"getStatus", "get-sms"})
+	c := New([]string{"getStatus", "get-sms"}, true)
 	got := c.Match("get-sms getStatus")
 	want := []string{"getStatus", "get-sms"} // configuration order, not line order
 	if !reflect.DeepEqual(got, want) {
@@ -97,7 +97,7 @@ func TestMatchIsIndependentOfOrder(t *testing.T) {
 // configuration validator warns about this; the matcher itself does not special
 // case it, and this test pins that behaviour down.
 func TestPrefixOverlapIncrementsBoth(t *testing.T) {
-	c := New([]string{"getStatus", "getStatusExtended"})
+	c := New([]string{"getStatus", "getStatusExtended"}, true)
 	got := c.ProcessLine("call getStatusExtended once")
 	want := []string{"getStatus", "getStatusExtended"}
 	if !reflect.DeepEqual(got, want) {
@@ -105,8 +105,125 @@ func TestPrefixOverlapIncrementsBoth(t *testing.T) {
 	}
 }
 
+// With case_sensitive: no the line and the code words are folded before the
+// substring search, so any spelling in the log feeds the counter of the word.
+func TestProcessLineCaseInsensitive(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want []string
+	}{
+		{
+			name: "the configured spelling still matches",
+			line: `"GET /api/get-number?x=1 HTTP/1.1" 200`,
+			want: []string{"get-number"},
+		},
+		{
+			name: "upper case in the line",
+			line: "GET-NUMBER",
+			want: []string{"get-number"},
+		},
+		{
+			name: "mixed case in the line",
+			line: "call Get-Number now",
+			want: []string{"get-number"},
+		},
+		{
+			name: "a word spelled in the config with capitals matches lower case",
+			line: "getnumber and getstatus",
+			want: []string{"getNumber", "getStatus"},
+		},
+		{
+			name: "still counted once per line",
+			line: "GET-NUMBER then get-number again",
+			want: []string{"get-number"},
+		},
+		{
+			name: "several words in one line, configuration order",
+			line: "GETSTATUS after GET-SMS",
+			want: []string{"get-sms", "getStatus"},
+		},
+		{
+			name: "a word that is simply absent still does not match",
+			line: `"GET /health HTTP/1.1" 200`,
+			want: nil,
+		},
+		{
+			name: "empty line",
+			line: "",
+			want: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := New(defaultActions, false)
+			got := c.ProcessLine(tc.line)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("ProcessLine(%q) = %v, want %v", tc.line, got, tc.want)
+			}
+			for _, a := range tc.want {
+				if c.Drain0(a) != 1 {
+					t.Fatalf("counter of %q must be 1", a)
+				}
+			}
+		})
+	}
+}
+
+// The case of the log line must not leak into the counter keys: whatever the
+// line looked like, the increment belongs to the word as it is spelled in the
+// configuration, which is what the Redis key is built from.
+func TestCaseInsensitiveKeepsTheConfiguredSpelling(t *testing.T) {
+	c := New([]string{"getNumber"}, false)
+	if got := c.ProcessLine("GETNUMBER"); !reflect.DeepEqual(got, []string{"getNumber"}) {
+		t.Fatalf("ProcessLine = %v, want [getNumber]", got)
+	}
+	c.ProcessLine("getnumber")
+
+	want := map[string]int64{"getNumber": 2}
+	if got := c.Drain(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Drain = %v, want %v", got, want)
+	}
+	if got := c.Actions(); !reflect.DeepEqual(got, []string{"getNumber"}) {
+		t.Fatalf("Actions = %v, folding must not rewrite the configured words", got)
+	}
+}
+
+// Folding is not limited to ASCII: strings.ToLower covers the same alphabets a
+// log line may carry.
+func TestCaseInsensitiveFoldsNonASCII(t *testing.T) {
+	c := New([]string{"Получить-Номер"}, false)
+	if got := c.ProcessLine("метод ПОЛУЧИТЬ-НОМЕР вызван"); !reflect.DeepEqual(got, []string{"Получить-Номер"}) {
+		t.Fatalf("ProcessLine = %v, want [Получить-Номер]", got)
+	}
+}
+
+// Overlaps that only exist without case behave like any other overlap: both
+// counters advance. The config validator is the place that warns about them.
+func TestCaseInsensitiveOverlapIncrementsBoth(t *testing.T) {
+	c := New([]string{"getstatus", "GetStatusExtended"}, false)
+	got := c.ProcessLine("call GETSTATUSEXTENDED once")
+	want := []string{"getstatus", "GetStatusExtended"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ProcessLine = %v, want %v", got, want)
+	}
+}
+
+// Two words differing only in case keep separate counters; the validator warns
+// about the pair, the matcher just increments both.
+func TestCaseInsensitiveTwinsKeepSeparateCounters(t *testing.T) {
+	c := New([]string{"getNumber", "GETNUMBER"}, false)
+	c.ProcessLine("getnumber")
+
+	want := map[string]int64{"getNumber": 1, "GETNUMBER": 1}
+	if got := c.Drain(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Drain = %v, want %v", got, want)
+	}
+}
+
 func TestAccumulateAndDrain(t *testing.T) {
-	c := New(defaultActions)
+	c := New(defaultActions, true)
 	c.ProcessLine("get-number")
 	c.ProcessLine("get-number and get-sms")
 	c.ProcessLine("nothing here")
@@ -132,7 +249,7 @@ func TestAccumulateAndDrain(t *testing.T) {
 }
 
 func TestRestoreAddsToWhatArrivedMeanwhile(t *testing.T) {
-	c := New(defaultActions)
+	c := New(defaultActions, true)
 	c.ProcessLine("get-number")
 	drained := c.Drain()
 
@@ -148,7 +265,7 @@ func TestRestoreAddsToWhatArrivedMeanwhile(t *testing.T) {
 
 func TestActionsIsACopy(t *testing.T) {
 	src := []string{"a", "b"}
-	c := New(src)
+	c := New(src, true)
 	src[0] = "mutated"
 	if got := c.Actions(); got[0] != "a" {
 		t.Fatalf("Actions = %v, counter must not alias its input", got)
@@ -161,7 +278,7 @@ func TestActionsIsACopy(t *testing.T) {
 }
 
 func TestConcurrentProcessAndDrain(t *testing.T) {
-	c := New(defaultActions)
+	c := New(defaultActions, true)
 	const writers, perWriter = 8, 500
 
 	total := map[string]int64{}

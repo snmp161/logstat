@@ -10,33 +10,59 @@ import (
 // Counter accumulates per-action increments until they are drained into Redis.
 //
 // Matching rule (see the specification, §3): an action is counted once per line
-// in which it occurs as a case-sensitive substring, no matter how many times it
-// occurs in that line. Actions are matched independently of each other.
+// in which it occurs as a substring, no matter how many times it occurs in that
+// line. Actions are matched independently of each other. The comparison honours
+// the case unless the counter was built case-insensitive, in which case both the
+// line and the actions are lowercased before the search.
 type Counter struct {
-	actions []string
+	actions       []string
+	caseSensitive bool
+	// needles holds what is actually searched for, parallel to actions: the
+	// actions themselves when the case counts, their lowercased form otherwise.
+	needles []string
 
 	mu      sync.Mutex
 	pending map[string]int64
 	lines   int64
 }
 
-// New returns a counter for the given actions.
-func New(actions []string) *Counter {
-	return &Counter{
-		actions: append([]string{}, actions...),
-		pending: make(map[string]int64, len(actions)),
+// New returns a counter for the given actions. With caseSensitive false the
+// matching ignores the case; the increments are still keyed by the action as it
+// is spelled in the configuration, never as it appeared in the line.
+func New(actions []string, caseSensitive bool) *Counter {
+	c := &Counter{
+		actions:       append([]string{}, actions...),
+		caseSensitive: caseSensitive,
+		needles:       make([]string, len(actions)),
+		pending:       make(map[string]int64, len(actions)),
 	}
+	for i, a := range c.actions {
+		if caseSensitive {
+			c.needles[i] = a
+		} else {
+			c.needles[i] = strings.ToLower(a)
+		}
+	}
+	return c
 }
 
 // Actions returns the configured actions, in configuration order.
 func (c *Counter) Actions() []string { return append([]string{}, c.actions...) }
 
+// CaseSensitive reports whether the matching honours the case.
+func (c *Counter) CaseSensitive() bool { return c.caseSensitive }
+
 // Match reports which actions occur in line, in configuration order.
 func (c *Counter) Match(line string) []string {
+	// One allocation per line instead of one per action: the needles are already
+	// folded, so the line is the only thing left to lower.
+	if !c.caseSensitive {
+		line = strings.ToLower(line)
+	}
 	var matched []string
-	for _, a := range c.actions {
-		if strings.Contains(line, a) {
-			matched = append(matched, a)
+	for i, needle := range c.needles {
+		if strings.Contains(line, needle) {
+			matched = append(matched, c.actions[i])
 		}
 	}
 	return matched

@@ -62,7 +62,7 @@ func New(cfg *config.Config, lg *slog.Logger, st *store.Store, opts ...Option) *
 		cfg:               cfg,
 		log:               lg,
 		store:             st,
-		cnt:               counter.New(cfg.Actions),
+		cnt:               counter.New(cfg.Actions, cfg.CaseSensitive),
 		pendingHeartbeats: make(map[string]int64),
 		pendingResets:     make(map[string]bool),
 	}
@@ -80,6 +80,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.log.Info("starting",
 		"log_path", d.cfg.LogPath,
 		"actions", len(d.cfg.Actions),
+		"case_sensitive", d.cfg.CaseSensitive,
 		"flush_interval", d.cfg.FlushInterval,
 		"poll", d.cfg.Poll,
 		"redis", d.cfg.Redis.Addr(),
