@@ -57,6 +57,3 @@ func (l *Lock) Release() error {
 	l.f = nil
 	return err
 }
-
-// Path returns the lock file path.
-func (l *Lock) Path() string { return l.path }

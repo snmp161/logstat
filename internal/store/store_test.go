@@ -219,8 +219,8 @@ func TestIncrAndSetValue(t *testing.T) {
 		t.Errorf("value = %q, want %q", got, want)
 	}
 
-	if v, err := st.Get(ctx, "get-sms"); err != nil || v != 7 {
-		t.Errorf("Get = %d, %v; want 7, nil", v, err)
+	if got, err := st.Counters(ctx, []string{"get-sms"}); err != nil || got["get-sms"] != 7 {
+		t.Errorf("Counters = %v, %v; want 7, nil", got, err)
 	}
 }
 
@@ -308,21 +308,15 @@ func TestReset(t *testing.T) {
 	}
 }
 
-func TestPingAndErrorsWhenRedisIsDown(t *testing.T) {
+func TestEveryOperationFailsWhenRedisIsDown(t *testing.T) {
 	if testing.Short() {
 		t.Skip("slow: waits for the go-redis dial retries")
 	}
 	st, mr := newStore(t)
 	ctx := context.Background()
 
-	if err := st.Ping(ctx); err != nil {
-		t.Fatalf("Ping: %v", err)
-	}
 	mr.Close()
 
-	if err := st.Ping(ctx); err == nil {
-		t.Error("Ping must fail once Redis is gone")
-	}
 	if _, err := st.Incr(ctx, "a", 1); err == nil {
 		t.Error("Incr must fail once Redis is gone")
 	}
@@ -335,8 +329,8 @@ func TestPingAndErrorsWhenRedisIsDown(t *testing.T) {
 	if err := st.Init(ctx, []string{"a"}, ts); err == nil {
 		t.Error("Init must fail once Redis is gone")
 	}
-	if _, err := st.Get(ctx, "a"); err == nil {
-		t.Error("Get must fail once Redis is gone")
+	if _, err := st.Counters(ctx, []string{"a"}); err == nil {
+		t.Error("Counters must fail once Redis is gone")
 	}
 }
 
@@ -356,9 +350,6 @@ func TestNewUsesConfiguredAddress(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	ctx := context.Background()
-	if err := st.Ping(ctx); err != nil {
-		t.Fatalf("Ping: %v", err)
-	}
 	if _, err := st.Incr(ctx, "a", 5); err != nil {
 		t.Fatalf("Incr: %v", err)
 	}
@@ -387,10 +378,8 @@ func TestIsUnavailable(t *testing.T) {
 		t.Errorf("a server reply error must not count as unavailable: %v", err)
 	}
 
-	if _, err := st.Get(ctx, "missing"); err == nil {
-		t.Fatal("GET of a missing key must fail")
-	} else if IsUnavailable(err) {
-		t.Errorf("redis.Nil must not count as unavailable: %v", err)
+	if IsUnavailable(redis.Nil) {
+		t.Error("redis.Nil is a reply from a healthy server, not an outage")
 	}
 
 	// A dead server does.

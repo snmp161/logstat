@@ -86,7 +86,7 @@ func (c *Counter) Drain0(action string) int64 {
 
 func TestMatchIsIndependentOfOrder(t *testing.T) {
 	c := New([]string{"getStatus", "get-sms"}, true)
-	got := c.Match("get-sms getStatus")
+	got := c.match("get-sms getStatus")
 	want := []string{"getStatus", "get-sms"} // configuration order, not line order
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Match = %v, want %v", got, want)
@@ -185,8 +185,8 @@ func TestCaseInsensitiveKeepsTheConfiguredSpelling(t *testing.T) {
 	if got := c.Drain(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Drain = %v, want %v", got, want)
 	}
-	if got := c.Actions(); !reflect.DeepEqual(got, []string{"getNumber"}) {
-		t.Fatalf("Actions = %v, folding must not rewrite the configured words", got)
+	if _, ok := c.Matched()["getNumber"]; !ok {
+		t.Fatalf("Matched = %v, folding must not rewrite the configured words", c.Matched())
 	}
 }
 
@@ -330,17 +330,15 @@ func TestRestoreAddsToWhatArrivedMeanwhile(t *testing.T) {
 	c.Restore(nil) // must not panic
 }
 
-func TestActionsIsACopy(t *testing.T) {
+func TestNewCopiesItsInput(t *testing.T) {
 	src := []string{"a", "b"}
 	c := New(src, true)
 	src[0] = "mutated"
-	if got := c.Actions(); got[0] != "a" {
-		t.Fatalf("Actions = %v, counter must not alias its input", got)
-	}
-	got := c.Actions()
-	got[1] = "mutated"
-	if c.Actions()[1] != "b" {
-		t.Fatal("Actions must return a copy")
+
+	c.ProcessLine("a and b")
+	got := c.Matched()
+	if got["a"] != 1 || got["b"] != 1 {
+		t.Fatalf("Matched = %v, the counter must not alias the slice it was given", got)
 	}
 }
 

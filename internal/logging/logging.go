@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"os"
 	"strconv"
@@ -47,8 +46,8 @@ func New(cfg config.Logging) (*Logger, error) {
 	}, nil
 }
 
-// NewWriter builds a logger writing to an arbitrary writer. Used by tests and
-// by the CLI before the configuration has been read.
+// NewWriter builds a logger writing to an arbitrary writer, the seam the tests
+// use to read what the daemon logged.
 func NewWriter(w io.Writer, level slog.Level) *Logger {
 	out := &output{w: w}
 	return &Logger{Logger: slog.New(&handler{out: out, level: level}), out: out}
@@ -61,13 +60,6 @@ func (l *Logger) Reopen() error { return l.out.reopen() }
 
 // Close releases the log file, if any.
 func (l *Logger) Close() error { return l.out.close() }
-
-// StdLogger returns a *log.Logger that forwards every line to this logger at
-// the given level with the given attributes. Used to capture the output of
-// libraries that only speak the standard log package (nxadm/tail).
-func (l *Logger) StdLogger(level slog.Level, args ...any) *log.Logger {
-	return log.New(&slogWriter{logger: l.Logger, level: level, args: args}, "", 0)
-}
 
 // ParseLevel maps a configuration level name to an slog.Level.
 func ParseLevel(name string) (slog.Level, error) {
@@ -239,19 +231,4 @@ func levelName(l slog.Level) string {
 	default:
 		return "ERROR"
 	}
-}
-
-// slogWriter adapts the standard log package to slog.
-type slogWriter struct {
-	logger *slog.Logger
-	level  slog.Level
-	args   []any
-}
-
-func (w *slogWriter) Write(p []byte) (int, error) {
-	msg := strings.TrimRight(string(p), "\n")
-	if msg != "" {
-		w.logger.Log(context.Background(), w.level, msg, w.args...)
-	}
-	return len(p), nil
 }

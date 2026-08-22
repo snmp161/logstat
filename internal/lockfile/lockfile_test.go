@@ -18,9 +18,6 @@ func TestAcquireCreatesDirectoryAndWritesPID(t *testing.T) {
 	}
 	defer func() { _ = lock.Release() }()
 
-	if lock.Path() != path {
-		t.Errorf("Path = %q, want %q", lock.Path(), path)
-	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read lock file: %v", err)

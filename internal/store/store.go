@@ -127,9 +127,6 @@ func (s *Store) keys(action string) []string {
 // Close releases the Redis connection pool.
 func (s *Store) Close() error { return s.rdb.Close() }
 
-// Ping checks that Redis is reachable.
-func (s *Store) Ping(ctx context.Context) error { return s.rdb.Ping(ctx).Err() }
-
 // Init creates the keys of actions that do not exist yet without touching
 // existing values, so that a restart never loses what was already counted and a
 // fresh install is immediately readable by the monitoring side.
@@ -257,13 +254,4 @@ func (s *Store) Counters(ctx context.Context, actions []string) (map[string]int6
 		out[actions[i]] = n
 	}
 	return out, nil
-}
-
-// Get returns the current value of the integer counter for action.
-func (s *Store) Get(ctx context.Context, action string) (int64, error) {
-	n, err := s.rdb.Get(ctx, CounterKey(s.host, action)).Int64()
-	if err != nil {
-		return 0, fmt.Errorf("get counter %q: %w", action, err)
-	}
-	return n, nil
 }

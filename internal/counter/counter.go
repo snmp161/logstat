@@ -54,14 +54,8 @@ func New(actions []string, caseSensitive bool) *Counter {
 	return c
 }
 
-// Actions returns the configured actions, in configuration order.
-func (c *Counter) Actions() []string { return append([]string{}, c.actions...) }
-
-// CaseSensitive reports whether the matching honours the case.
-func (c *Counter) CaseSensitive() bool { return c.caseSensitive }
-
-// Match reports which actions occur in line, in configuration order.
-func (c *Counter) Match(line string) []string {
+// match reports which actions occur in line, in configuration order.
+func (c *Counter) match(line string) []string {
 	// One allocation per line instead of one per action: the needles are already
 	// folded, so the line is the only thing left to lower.
 	if !c.caseSensitive {
@@ -79,7 +73,7 @@ func (c *Counter) Match(line string) []string {
 // ProcessLine applies the matching rule to a single log line and returns the
 // actions that were incremented.
 func (c *Counter) ProcessLine(line string) []string {
-	matched := c.Match(line)
+	matched := c.match(line)
 	c.mu.Lock()
 	c.lines++
 	for _, a := range matched {

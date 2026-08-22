@@ -180,18 +180,3 @@ func TestNewRejectsBadLevelAndUnwritableFile(t *testing.T) {
 		t.Error("New must fail when the log file cannot be opened")
 	}
 }
-
-func TestStdLogger(t *testing.T) {
-	var buf bytes.Buffer
-	lg := NewWriter(&buf, slog.LevelDebug)
-	std := lg.StdLogger(slog.LevelInfo, "component", "tail")
-	std.Printf("Re-opening moved/deleted file %s ...", "/var/log/app.log")
-
-	out := buf.String()
-	if !strings.Contains(out, "Re-opening moved/deleted file") || !strings.Contains(out, "component=tail") {
-		t.Fatalf("out = %q", out)
-	}
-	if strings.Count(out, "\n") != 1 {
-		t.Fatalf("expected exactly one line, got %q", out)
-	}
-}
