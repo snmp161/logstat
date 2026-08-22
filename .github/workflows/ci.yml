@@ -22,6 +22,7 @@ env:
   # it publishes — that red would land on a tag.
   GOLANGCI_VERSION: "v2.12.2"
   NFPM_VERSION: "v2.46.0"
+  GORELEASER_VERSION: "v2.17.1"
 
 jobs:
   lint:
@@ -128,20 +129,47 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: install nfpm
-        run: go install "github.com/goreleaser/nfpm/v2/cmd/nfpm@${NFPM_VERSION}"
+      # The release is built by GoReleaser, so the packages the install jobs
+      # below get have to come from there too — testing what `make package`
+      # produces would test a config nobody downloads.
+      - name: check the release config
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: ${{ env.GORELEASER_VERSION }}
+          args: check
 
-      - name: build packages
-        run: |
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-          export PATH="$PATH:$(go env GOPATH)/bin"
-          make package
+      - name: build the release packages
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: ${{ env.GORELEASER_VERSION }}
+          args: release --snapshot --clean --skip=publish
 
       - name: inspect the deb
         run: |
           deb=$(ls dist/*_amd64.deb)
           dpkg-deb --info "$deb"
           dpkg-deb --contents "$deb"
+          # The name the install snippet on the release page tells people to run.
+          case "$deb" in
+            dist/logstat_*-1_amd64.deb) ;;
+            *) echo "::error::unexpected package name $deb"; exit 1 ;;
+          esac
+
+      # nfpm.yaml is the local packaging path (`make package`) and duplicates the
+      # layout GoReleaser carries in its own config. It is built here too and
+      # compared against the release package: the point is to notice the day the
+      # two drift apart, not to ship what it produces. Both write to dist/, so
+      # the release artifacts step aside first.
+      - name: build the local packages and compare
+        run: |
+          mv dist dist-release
+          go install "github.com/goreleaser/nfpm/v2/cmd/nfpm@${NFPM_VERSION}"
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          make package
+          diff \
+            <(dpkg-deb --contents dist-release/*_amd64.deb | awk '{print $NF, $1}' | sort) \
+            <(dpkg-deb --contents dist/*_amd64.deb         | awk '{print $NF, $1}' | sort)
+          rm -rf dist && mv dist-release dist
 
       - uses: actions/upload-artifact@v4
         with:

@@ -61,6 +61,7 @@ Invariants that are easy to break and hard to notice:
 
 ## Working in this repo
 
+- `docs/release.md` is the checklist for cutting a release: the parts that are not automated (a day-long soak, the upgrade notes, installing the published artifact once).
 - `docs/specification.md` (Russian) is the source of truth for behaviour and carries the reasoning behind each decision, including an "Appendix A: fixed decisions" table. Update it when behaviour changes.
 - `README.md` (English, primary) and `README.ru.md` are a translation pair — a change to one belongs in the other in the same commit, including the parameter tables and the config example.
 - `packaging/default.yaml` is the shipped example config and documents every field in comments; new options belong there too.

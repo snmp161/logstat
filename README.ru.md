@@ -245,6 +245,8 @@ make help
 
 Версия, commit и дата сборки вшиваются через `-ldflags` и видны в `logstat version`. По умолчанию версия берётся из `git describe`; можно задать явно: `make build VERSION=v1.2.3`.
 
+У выпуска релиза есть свой чеклист: [`docs/release.md`](docs/release.md).
+
 Пакеты собираются через [nfpm](https://github.com/goreleaser/nfpm) из готового бинарника — один [`nfpm.yaml`](nfpm.yaml) на оба формата. Релизы собирает GoReleaser по [`.goreleaser.yaml`](.goreleaser.yaml): при пуше тега `v*` workflow [`release.yml`](.github/workflows/release.yml) публикует GitHub Release с бинарниками, `.deb`, `.rpm` и checksums. На каждый push и PR workflow [`ci.yml`](.github/workflows/ci.yml) прогоняет lint, `go test -race` с покрытием, кросс-сборку и сборку пакетов.
 
 ## Установка пакета

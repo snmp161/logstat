@@ -1,3 +1,4 @@
 /dist/
+/dist-*/
 coverage.out
 coverage.html

@@ -245,6 +245,8 @@ make help
 
 The version, commit and build date are baked in through `-ldflags` and shown by `logstat version`. By default the version comes from `git describe`; it can be set explicitly: `make build VERSION=v1.2.3`.
 
+Cutting a release has a checklist of its own: [`docs/release.md`](docs/release.md).
+
 Packages are built with [nfpm](https://github.com/goreleaser/nfpm) from the compiled binary — a single [`nfpm.yaml`](nfpm.yaml) covers both formats. Releases are built by GoReleaser from [`.goreleaser.yaml`](.goreleaser.yaml): on a `v*` tag push the [`release.yml`](.github/workflows/release.yml) workflow publishes a GitHub Release with the binaries, the `.deb`, the `.rpm` and checksums. On every push and pull request the [`ci.yml`](.github/workflows/ci.yml) workflow runs lint, `go test -race` with coverage, the cross build and the package build.
 
 ## Installing the package

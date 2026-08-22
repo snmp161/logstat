@@ -13,6 +13,7 @@ env:
   # lints before it publishes, so an unpinned linter can fail a tag build months
   # after the code was written.
   GOLANGCI_VERSION: "v2.12.2"
+  GORELEASER_VERSION: "v2.17.1"
 
 jobs:
   verify:
@@ -61,7 +62,7 @@ jobs:
       - uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
-          version: "~> v2"
+          version: ${{ env.GORELEASER_VERSION }}
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
