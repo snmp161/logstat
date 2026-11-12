@@ -5,7 +5,7 @@ go 1.25.0
 toolchain go1.25.13
 
 require (
-	github.com/alicebob/miniredis/v2 v2.38.0
+	github.com/alicebob/miniredis/v2 v2.39.0
 	github.com/nxadm/tail v1.4.11
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.2
